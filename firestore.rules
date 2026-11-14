@@ -1,0 +1,22 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function activeStoreMember() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/stores/doce-cacau/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/stores/doce-cacau/users/$(request.auth.uid)).data.active == true;
+    }
+
+    // Os dois administradores mantêm permissões equivalentes, mas somente
+    // contas previamente cadastradas e ativas na equipe acessam os dados.
+    match /stores/doce-cacau/users/{userId} {
+      allow read: if activeStoreMember() || (signedIn() && request.auth.uid == userId);
+      allow create, update, delete: if activeStoreMember();
+    }
+    match /stores/doce-cacau/{collectionName}/{documentId} {
+      allow read, write: if activeStoreMember()
+        && collectionName in ['products', 'orders', 'stock_movements'];
+    }
+  }
+}
