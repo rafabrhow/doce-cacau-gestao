@@ -5,7 +5,7 @@ export type Product = {
 export type OrderItem = { productId: string; name: string; barcode: string; quantity: number; unitPrice: number }
 export type PaymentRecord = { id: string; amount: number; method: 'Pix'|'Dinheiro'|'Cartão de crédito'|'Cartão de débito'|'Transferência'|'Outro'; date: string; user: string; userId?: string }
 export type Order = {
-  id: string; customer: string; phone: string; items: OrderItem[]; total: number;
+  id: string; customer: string; phone: string; items: OrderItem[]; total: number; subtotal?: number; discount?: number;
   paymentStatus: 'Pago' | 'A pagar' | 'Parcial'; deliveryStatus: 'Reservado' | 'Entregue';
   paid: number; payments?: PaymentRecord[]; seller: string; createdAt: string; pickupDate: string; notes: string; createdBy?: string; createdByName?: string; updatedBy?: string; updatedByName?: string;
 }
