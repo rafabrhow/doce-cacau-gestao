@@ -439,6 +439,17 @@ td {
   .main{position:relative;z-index:1}
   .pos-layout,.pos-layout>.panel:first-child,.product-search-area,
   .product-search-area .product-picker.open{z-index:auto}
+  /* No celular, a lista entra no fluxo da página e empurra o carrinho para baixo. */
+  .product-search-area .product-picker.open{
+    position:relative;
+    top:auto;
+    left:auto;
+    right:auto;
+    z-index:1;
+    max-height:min(46vh,360px);
+    margin-top:10px;
+  }
+  .pos-layout>.cart-panel{position:relative;z-index:0}
 }
 /* Correção: respiro interno no cartão do pedido e no total */
 .cart-panel{
@@ -595,3 +606,42 @@ td {
 .upload-image-button{position:relative;overflow:hidden;cursor:pointer}
 .upload-image-button input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
 @media(max-width:560px){.product-image-upload{align-items:flex-start}.product-image-preview{width:82px;height:82px;flex-basis:82px}}
+
+
+/* Ajuste definitivo do PDV em telas pequenas:
+   a lista de produtos participa do fluxo e empurra o carrinho para baixo. */
+@media (max-width: 760px) {
+  .pos-layout {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 14px !important;
+  }
+  .pos-layout > .panel:first-child {
+    position: relative !important;
+    z-index: auto !important;
+    overflow: visible !important;
+  }
+  .pos-layout .product-search-area {
+    position: static !important;
+    z-index: auto !important;
+    overflow: visible !important;
+  }
+  .pos-layout .product-search-area .product-picker.open {
+    display: block !important;
+    position: static !important;
+    inset: auto !important;
+    width: 100% !important;
+    max-height: min(46vh, 360px) !important;
+    overflow-y: auto !important;
+    margin: 10px 0 0 !important;
+    z-index: auto !important;
+    transform: none !important;
+  }
+  .pos-layout > .cart-panel {
+    position: relative !important;
+    inset: auto !important;
+    z-index: auto !important;
+    width: 100% !important;
+  }
+}
