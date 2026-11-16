@@ -1,7 +1,5 @@
 // Encaminha todas as rotas /api/loja/* para a aplicação Express compartilhada.
-// A rota explícita evita que o catch-all geral da Vercel deixe de reconhecer
-// endpoints aninhados da Loja Virtual em produção.
-import app from '../../../server.js'
+import app from '../../server.js'
 
 export const config = { api: { bodyParser: false } }
 
