@@ -16,7 +16,7 @@ service cloud.firestore {
     }
     match /stores/doce-cacau/{collectionName}/{documentId} {
       allow read, write: if activeStoreMember()
-        && collectionName in ['products', 'orders', 'stock_movements'];
+        && collectionName in ['products', 'orders', 'stock_movements', 'settings'];
     }
   }
 }

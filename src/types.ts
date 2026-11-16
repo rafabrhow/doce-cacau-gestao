@@ -1,8 +1,8 @@
 export type Product = {
   id: string; name: string; barcode: string; category: string; brand: string;
-  cost: number; price: number; stock: number; minStock: number; expiry: string; image: string; driveFileId?: string; outOfStockSince?: string | null; archived?: boolean; archivedAt?: string | null; archiveReason?: string | null; createdBy?: string; createdByName?: string; updatedBy?: string; updatedByName?: string; canceledAt?: string; canceledBy?: string; canceledByName?: string; cancelReason?: string; isCanceled?: boolean;
+  cost: number; price: number; stock: number; minStock: number; expiry: string; image: string; driveFileId?: string; driveFileId2?: string; outOfStockSince?: string | null; archived?: boolean; archivedAt?: string | null; archiveReason?: string | null; createdBy?: string; createdByName?: string; updatedBy?: string; updatedByName?: string; canceledAt?: string; canceledBy?: string; canceledByName?: string; cancelReason?: string; isCanceled?: boolean;
 }
-export type OrderItem = { productId: string; name: string; barcode: string; quantity: number; unitPrice: number }
+export type OrderItem = { productId: string; name: string; barcode: string; quantity: number; unitPrice: number; unitCost?: number }
 export type PaymentRecord = { id: string; amount: number; method: 'Pix'|'Dinheiro'|'Cartão de crédito'|'Cartão de débito'|'Transferência'|'Outro'; date: string; user: string; userId?: string }
 export type Order = {
   id: string; customer: string; phone: string; items: OrderItem[]; total: number; subtotal?: number; discount?: number;

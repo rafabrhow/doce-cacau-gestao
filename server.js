@@ -123,13 +123,16 @@ async function requireUser(req, res, next) {
     res.status(401).json({ error: 'Sessão inválida ou expirada. Entre novamente no sistema.' })
   }
 }
-async function getProductsFolder(drive) {
+async function getStoreRootFolder(drive) {
   const q = "name = 'Doce Cacau' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
   const found = await drive.files.list({ q, fields: 'files(id,name)', pageSize: 10 })
-  let parent = found.data.files?.[0]?.id
-  if (!parent) parent = (await drive.files.create({ requestBody: { name: 'Doce Cacau', mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' })).data.id
-  const q2 = `'${parent}' in parents and name = 'Produtos' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`
-  const child = await drive.files.list({ q: q2, fields: 'files(id,name)', pageSize: 10 })
+  if (found.data.files?.[0]?.id) return found.data.files[0].id
+  return (await drive.files.create({ requestBody: { name: 'Doce Cacau', mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' })).data.id
+}
+async function getProductsFolder(drive) {
+  const parent = await getStoreRootFolder(drive)
+  const q = `'${parent}' in parents and name = 'Produtos' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`
+  const child = await drive.files.list({ q, fields: 'files(id,name)', pageSize: 10 })
   if (child.data.files?.[0]?.id) return child.data.files[0].id
   return (await drive.files.create({ requestBody: { name: 'Produtos', mimeType: 'application/vnd.google-apps.folder', parents: [parent] }, fields: 'id' })).data.id
 }
@@ -214,6 +217,375 @@ app.delete('/api/drive/file/:id', requireUser, async (req, res) => {
     res.json({ ok: true })
   } catch (error) { console.error('Exclusão Drive:', error.message); res.status(error.status || 500).json({ error: error.status ? error.message : 'Não foi possível excluir a imagem.' }) }
 })
+
+
+
+// Catálogo público da Loja Virtual: entrega somente campos comerciais autorizados.
+app.get('/api/loja/catalogo', async (_req, res) => {
+  try {
+    if (!firebaseReady) return res.status(503).json({ error: 'Catálogo temporariamente indisponível.' })
+    const storeRef = admin.firestore().doc('stores/doce-cacau/settings/loja-virtual')
+    const settingsSnap = await storeRef.get()
+    const settings = settingsSnap.exists ? settingsSnap.data() : {}
+    if (settings.enabled !== true) return res.status(404).json({ error: 'A loja virtual está temporariamente fechada.' })
+    const productsSnap = await admin.firestore().collection('stores/doce-cacau/products').get()
+    const products = productsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+      .filter(p => p.archived !== true && Number(p.stock) > 0 && p.isCanceled !== true)
+      .map(p => ({
+        id: p.id,
+        name: String(p.name || ''),
+        category: String(p.category || ''),
+        brand: String(p.brand || ''),
+        price: Number(p.price) || 0,
+        imageUrl: p.driveFileId ? `/api/loja/imagem/${encodeURIComponent(String(p.driveFileId))}` : (String(p.image || '').startsWith('https://') ? p.image : ''),
+        imageUrls: [
+          p.driveFileId ? `/api/loja/imagem/${encodeURIComponent(String(p.driveFileId))}` : (String(p.image || '').startsWith('https://') ? p.image : ''),
+          p.driveFileId2 ? `/api/loja/imagem/${encodeURIComponent(String(p.driveFileId2))}` : ''
+        ].filter(Boolean)
+      }))
+      .filter(p => p.name && p.price > 0)
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({ storeName: 'Doce Cacau', products })
+  } catch (error) {
+    console.error('Catálogo público:', error)
+    res.status(500).json({ error: 'Não foi possível carregar o catálogo.' })
+  }
+})
+
+// Imagens públicas somente quando o arquivo pertence a um produto atualmente disponível.
+app.get('/api/loja/imagem/:id', async (req, res) => {
+  try {
+    if (!firebaseReady) return res.status(503).end()
+    const fileId = String(req.params.id || '')
+    const productsRef = admin.firestore().collection('stores/doce-cacau/products')
+    const [primarySnap,secondarySnap] = await Promise.all([
+      productsRef.where('driveFileId', '==', fileId).limit(1).get(),
+      productsRef.where('driveFileId2', '==', fileId).limit(1).get()
+    ])
+    const product = primarySnap.docs[0]?.data() || secondarySnap.docs[0]?.data()
+    if (!product || product.archived === true || Number(product.stock) <= 0) return res.status(404).end()
+    const auth = await loadDriveAuth()
+    if (!auth) return res.status(503).end()
+    const drive = google.drive({ version: 'v3', auth })
+    const metadata = await assertProductImage(drive, fileId)
+    const result = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' })
+    res.setHeader('Content-Type', metadata.mimeType)
+    res.setHeader('Cache-Control', 'public, max-age=300')
+    result.data.on('error', error => { console.error('Imagem pública Drive:', error); if (!res.headersSent) res.status(502).end() })
+    result.data.pipe(res)
+  } catch (error) {
+    console.error('Imagem do catálogo:', error.message)
+    if (!res.headersSent) res.status(error.status || 404).end()
+  }
+})
+
+
+// Checkout público: rascunhos e pedidos ficam isolados das vendas/financeiro do PDV.
+function publicDraftRef(token) {
+  if (!/^[a-f0-9-]{32,36}$/i.test(token)) throw new Error('Identificador do pedido inválido.')
+  return admin.firestore().doc(`stores/doce-cacau/public_order_drafts/${token}`)
+}
+async function validatePublicItems(items) {
+  if (!Array.isArray(items) || !items.length || items.length > 40) throw new Error('A sacola está vazia ou contém itens demais.')
+  const db = admin.firestore()
+  const normalized = []
+  for (const entry of items) {
+    const productId = String(entry.productId || '')
+    const quantity = Number(entry.quantity)
+    if (!productId || !Number.isInteger(quantity) || quantity < 1 || quantity > 30) throw new Error('Quantidade de produto inválida.')
+    const snap = await db.doc(`stores/doce-cacau/products/${productId}`).get()
+    if (!snap.exists) throw new Error('Um produto da sacola não está mais disponível.')
+    const p = snap.data()
+    if (p.archived === true || p.isCanceled === true || Number(p.stock) < quantity || Number(p.price) <= 0) {
+      throw new Error(`Estoque insuficiente ou produto indisponível: ${p.name || 'produto'}.`)
+    }
+    normalized.push({
+      productId, name: String(p.name || ''), barcode: String(p.barcode || ''),
+      quantity, unitPrice: Number(p.price), unitCost: Math.max(0,Number(p.cost)||0), lineTotal: Number(p.price) * quantity
+    })
+  }
+  return normalized
+}
+function sanitizeCustomer(value = {}) {
+  const text = (v, max) => String(v || '').trim().slice(0, max)
+  const fulfillment = value.fulfillment === 'entrega' ? 'entrega' : 'retirada'
+  const payment = value.payment === 'pix_entrega' ? 'cartao' : (['pix_antecipado', 'cartao', 'dinheiro'].includes(value.payment) ? value.payment : 'pix_antecipado')
+  return {
+    name: text(value.name, 100), phone: text(value.phone, 25),
+    fulfillment, address: text(value.address, 220), reference: text(value.reference, 150),
+    payment, notes: text(value.notes, 400)
+  }
+}
+app.get('/api/loja/checkout', async (_req, res) => {
+  try {
+    if (!firebaseReady) return res.status(503).json({ error: 'Checkout temporariamente indisponível.' })
+    const db = admin.firestore()
+    const settingsSnap = await db.doc('stores/doce-cacau/settings/loja-virtual').get()
+    const s = settingsSnap.exists ? settingsSnap.data() : {}
+    if (s.enabled !== true) return res.status(404).json({ error: 'A loja virtual está temporariamente fechada.' })
+    const productsSnap = await db.collection('stores/doce-cacau/products').get()
+    const products = productsSnap.docs.map(d => ({ id: d.id, name: String(d.data().name || ''), price: Number(d.data().price) || 0 }))
+      .filter(p => p.name && p.price > 0)
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({
+      settings: {
+        allowCashOnDelivery: s.allowCashOnDelivery === true,
+        allowPixAdvance: s.allowPixAdvance === true,
+        allowCardOnDelivery: s.allowCardOnDelivery === true || (s.allowCardOnDelivery === undefined && s.allowPixOnDelivery === true),
+        pixKeyType: String(s.pixKeyType || 'aleatoria'), pixKey: String(s.pixKey || ''),
+        pixHolder: String(s.pixHolder || ''), pixCity: String(s.pixCity || ''),
+        allowPickup: s.allowPickup !== false, allowDelivery: s.allowDelivery === true,
+        deliveryFee: Math.max(0, Number(s.deliveryFee) || 0)
+      },
+      products
+    })
+  } catch (error) {
+    console.error('Configuração checkout:', error)
+    res.status(500).json({ error: 'Não foi possível preparar o checkout.' })
+  }
+})
+app.post('/api/loja/rascunhos', async (req, res) => {
+  try {
+    if (!firebaseReady) return res.status(503).json({ error: 'Serviço temporariamente indisponível.' })
+    const settingsSnap = await admin.firestore().doc('stores/doce-cacau/settings/loja-virtual').get()
+    if (!settingsSnap.exists || settingsSnap.data().enabled !== true) return res.status(404).json({ error: 'A loja virtual está temporariamente fechada.' })
+    const items = await validatePublicItems(req.body.items)
+    const customer = sanitizeCustomer(req.body.customer)
+    const token = randomBytes(18).toString('hex')
+    const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0)
+    await publicDraftRef(token).set({
+      token, items, customer, subtotal, status: 'rascunho',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+    })
+    res.status(201).json({ token })
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Não foi possível salvar o pedido.' })
+  }
+})
+app.get('/api/loja/rascunhos/:token', async (req, res) => {
+  try {
+    if (!firebaseReady) return res.status(503).json({ error: 'Serviço temporariamente indisponível.' })
+    const snap = await publicDraftRef(String(req.params.token)).get()
+    if (!snap.exists) return res.status(404).json({ error: 'Pedido salvo não encontrado ou expirado.' })
+    const draft = snap.data()
+    if (draft.expiresAt?.toDate && draft.expiresAt.toDate().getTime() < Date.now()) return res.status(410).json({ error: 'O prazo para retomar este pedido expirou.' })
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({ draft: { items: draft.items || [], customer: draft.customer || {}, status: draft.status, orderNumber: draft.orderNumber || '', proofFileName: draft.proofFileName || '' } })
+  } catch (error) { res.status(400).json({ error: error.message || 'Não foi possível recuperar o pedido.' }) }
+})
+app.patch('/api/loja/rascunhos/:token', async (req, res) => {
+  try {
+    const ref = publicDraftRef(String(req.params.token))
+    const snap = await ref.get()
+    if (!snap.exists || snap.data().status === 'finalizado') return res.status(404).json({ error: 'Rascunho não encontrado ou já finalizado.' })
+    const items = await validatePublicItems(req.body.items)
+    const customer = sanitizeCustomer(req.body.customer)
+    await ref.update({ items, customer, subtotal: items.reduce((sum, item) => sum + item.lineTotal, 0), updatedAt: admin.firestore.FieldValue.serverTimestamp() })
+    res.json({ ok: true })
+  } catch (error) { res.status(400).json({ error: error.message || 'Não foi possível atualizar o pedido.' }) }
+})
+app.post('/api/loja/rascunhos/:token/comprovante', upload.single('proof'), async (req, res) => {
+  try {
+    if (!firebaseReady) return res.status(503).json({ error: 'Serviço temporariamente indisponível.' })
+    if (!req.file) return res.status(400).json({ error: 'Selecione o comprovante.' })
+    if (!['application/pdf', 'image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype)) return res.status(415).json({ error: 'Envie um PDF, JPG, PNG ou WEBP.' })
+    const ref = publicDraftRef(String(req.params.token))
+    const draft = await ref.get()
+    if (!draft.exists || draft.data().status === 'finalizado') return res.status(404).json({ error: 'Pedido salvo não encontrado.' })
+    const auth = await loadDriveAuth()
+    if (!auth) return res.status(503).json({ error: 'O recebimento de comprovantes está temporariamente indisponível. Entre em contato com a loja.' })
+    const drive = google.drive({ version: 'v3', auth })
+    const rootFolder = await getStoreRootFolder(drive)
+    const q = `'${rootFolder}' in parents and name = 'Comprovantes Loja Virtual' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`
+    const found = await drive.files.list({ q, fields: 'files(id)', pageSize: 5 })
+    const folderId = found.data.files?.[0]?.id || (await drive.files.create({
+      requestBody: { name: 'Comprovantes Loja Virtual', mimeType: 'application/vnd.google-apps.folder', parents: [rootFolder] }, fields: 'id'
+    })).data.id
+    const safeName = String(req.file.originalname || 'comprovante').replace(/[^\w.-]/g, '_').slice(0, 80)
+    const uploaded = await drive.files.create({
+      requestBody: { name: `pedido-${String(req.params.token).slice(0, 8)}-${Date.now()}-${safeName}`, mimeType: req.file.mimetype, parents: [folderId] },
+      media: { mimeType: req.file.mimetype, body: Readable.from(req.file.buffer) }, fields: 'id,name'
+    })
+    await ref.update({ proofFileId: uploaded.data.id, proofFileName: safeName, updatedAt: admin.firestore.FieldValue.serverTimestamp() })
+    res.json({ ok: true, fileName: safeName })
+  } catch (error) {
+    console.error('Comprovante Loja Virtual:', error)
+    res.status(500).json({ error: 'Não foi possível anexar o comprovante.' })
+  }
+})
+
+// Painel administrativo dos pedidos recebidos pela Loja Virtual.
+app.get('/api/loja/admin/pedidos', requireUser, async (_req, res) => {
+  try {
+    const snap = await admin.firestore().collection('stores/doce-cacau/public_orders').get()
+    const orders = snap.docs.map(d => ({ id: d.id, ...d.data(), proofFileId: d.data().proofFileId || null }))
+      .sort((a, b) => {
+        const at = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0
+        const bt = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0
+        return bt - at
+      })
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({ orders })
+  } catch (error) {
+    console.error('Lista pedidos Loja Virtual:', error)
+    res.status(500).json({ error: 'Não foi possível carregar os pedidos da loja.' })
+  }
+})
+
+app.get('/api/loja/admin/comprovante/:token', requireUser, async (req, res) => {
+  try {
+    const snap = await admin.firestore().doc(`stores/doce-cacau/public_orders/${String(req.params.token)}`).get()
+    if (!snap.exists || !snap.data().proofFileId) return res.status(404).json({ error: 'Este pedido não possui comprovante.' })
+    const auth = await loadDriveAuth()
+    if (!auth) return res.status(503).json({ error: 'Google Drive não está conectado.' })
+    const drive = google.drive({ version: 'v3', auth })
+    const fileId = String(snap.data().proofFileId)
+    const metadata = await drive.files.get({ fileId, fields: 'id,name,mimeType,parents,trashed' })
+    const rootFolder = await getStoreRootFolder(drive)
+    const q = `'${rootFolder}' in parents and name = 'Comprovantes Loja Virtual' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`
+    const folders = await drive.files.list({ q, fields: 'files(id)', pageSize: 5 })
+    const folderId = folders.data.files?.[0]?.id
+    if (!folderId || metadata.data.trashed || !(metadata.data.parents || []).includes(folderId) || !['application/pdf','image/jpeg','image/png','image/webp'].includes(metadata.data.mimeType)) return res.status(403).json({ error: 'Comprovante inválido.' })
+    const file = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' })
+    res.setHeader('Content-Type', metadata.data.mimeType)
+    res.setHeader('Content-Disposition', `inline; filename="${String(metadata.data.name || 'comprovante').replace(/["\r\n]/g, '')}"`)
+    res.setHeader('Cache-Control', 'no-store')
+    file.data.on('error', error => { console.error('Leitura comprovante:', error); if (!res.headersSent) res.status(502).end() })
+    file.data.pipe(res)
+  } catch (error) {
+    console.error('Comprovante administrativo:', error)
+    res.status(500).json({ error: 'Não foi possível abrir o comprovante.' })
+  }
+})
+
+app.patch('/api/loja/admin/pedidos/:token', requireUser, async (req, res) => {
+  try {
+    const action = String(req.body.action || '')
+    if (!['aprovar', 'recusar'].includes(action)) return res.status(400).json({ error: 'Ação inválida.' })
+    const db = admin.firestore()
+    const publicRef = db.doc(`stores/doce-cacau/public_orders/${String(req.params.token)}`)
+    const memberSnap = await db.doc(`stores/doce-cacau/users/${req.user.uid}`).get()
+    const operatorName = String(memberSnap.data()?.name || req.user.name || 'Equipe Doce Cacau')
+    if (action === 'recusar') {
+      await db.runTransaction(async tx => {
+        const snap = await tx.get(publicRef)
+        if (!snap.exists) throw new Error('Pedido não encontrado.')
+        if (snap.data().status !== 'pendente') throw new Error('Este pedido já foi analisado.')
+        tx.update(publicRef, { status: 'recusado', deliveryStatus: 'Pedido recusado', reviewedAt: admin.firestore.FieldValue.serverTimestamp(), reviewedBy: req.user.uid, reviewedByName: operatorName, rejectionReason: String(req.body.reason || '').slice(0, 300) })
+      })
+      return res.json({ ok: true, status: 'recusado' })
+    }
+
+    await db.runTransaction(async tx => {
+      const publicSnap = await tx.get(publicRef)
+      if (!publicSnap.exists) throw new Error('Pedido não encontrado.')
+      const publicOrder = publicSnap.data()
+      if (publicOrder.status !== 'pendente') throw new Error('Este pedido já foi analisado.')
+      const items = Array.isArray(publicOrder.items) ? publicOrder.items : []
+      if (!items.length) throw new Error('O pedido não possui produtos.')
+      const productRefs = items.map(item => db.doc(`stores/doce-cacau/products/${String(item.productId)}`))
+      const productSnaps = []
+      for (const ref of productRefs) productSnaps.push(await tx.get(ref))
+      productSnaps.forEach((snap, index) => {
+        const item = items[index]
+        if (!snap.exists) throw new Error(`Produto não encontrado: ${item.name || 'produto'}.`)
+        const product = snap.data()
+        if (product.archived === true || product.isCanceled === true || Number(product.stock) < Number(item.quantity)) throw new Error(`Estoque insuficiente ou produto indisponível: ${item.name || product.name}.`)
+      })
+      const now = new Date().toISOString()
+      const paidInAdvance = publicOrder.paymentMethod === 'pix_antecipado'
+      const total = Number(publicOrder.total) || 0
+      const orderId = `web-${String(req.params.token)}`
+      const orderRef = db.doc(`stores/doce-cacau/orders/${orderId}`)
+      const existing = await tx.get(orderRef)
+      if (existing.exists) throw new Error('Este pedido já foi encaminhado para vendas.')
+      const payments = paidInAdvance ? [{ id: `web-${String(req.params.token).slice(0, 12)}`, amount: total, method: 'Pix', date: now, user: operatorName, userId: req.user.uid }] : []
+      const notes = [
+        publicOrder.customer?.fulfillment === 'entrega' ? `Entrega: ${publicOrder.customer.address || ''}` : 'Retirada na loja',
+        publicOrder.customer?.reference ? `Referência: ${publicOrder.customer.reference}` : '',
+        publicOrder.customer?.notes ? `Observações do cliente: ${publicOrder.customer.notes}` : '',
+        `Pedido da Loja Virtual: ${publicOrder.orderNumber}`
+      ].filter(Boolean).join(' | ')
+      const order = {
+        id: orderId, customer: String(publicOrder.customer?.name || 'Cliente da loja'), phone: String(publicOrder.customer?.phone || ''),
+        items: items.map(item => ({ productId: String(item.productId), name: String(item.name || ''), barcode: String(item.barcode || ''), quantity: Number(item.quantity), unitPrice: Number(item.unitPrice), unitCost: Math.max(0,Number(item.unitCost)||0) })),
+        total, subtotal: Number(publicOrder.subtotal) || total, deliveryFee: Number(publicOrder.deliveryFee) || 0,
+        paymentStatus: paidInAdvance ? 'Pago' : 'A pagar', deliveryStatus: 'Reservado', paid: paidInAdvance ? total : 0,
+        payments, seller: 'Loja Virtual', createdAt: now,
+        pickupDate: publicOrder.customer?.fulfillment === 'entrega' ? 'Entrega' : 'Retirada', notes,
+        createdBy: req.user.uid, createdByName: operatorName, source: 'loja_virtual', publicOrderNumber: publicOrder.orderNumber
+      }
+      productSnaps.forEach((snap, index) => {
+        const item = items[index]
+        const product = snap.data()
+        const nextStock = Number(product.stock) - Number(item.quantity)
+        tx.update(productRefs[index], { stock: nextStock, outOfStockSince: nextStock > 0 ? null : product.outOfStockSince || now, updatedAt: admin.firestore.FieldValue.serverTimestamp() })
+        const movementId = `web-${String(req.params.token).slice(0, 10)}-${index}`
+        tx.set(db.doc(`stores/doce-cacau/stock_movements/${movementId}`), {
+          id: movementId, productId: snap.id, productName: String(product.name || item.name), type: 'Reserva', quantity: Number(item.quantity),
+          date: now, user: operatorName, userId: req.user.uid, detail: `Pedido Loja Virtual ${publicOrder.orderNumber}`
+        })
+      })
+      tx.create(orderRef, order)
+      tx.update(publicRef, { status: 'aprovado', deliveryStatus: 'Encaminhado para entrega', reviewedAt: admin.firestore.FieldValue.serverTimestamp(), reviewedBy: req.user.uid, reviewedByName: operatorName, internalOrderId: orderId })
+    })
+    res.json({ ok: true, status: 'aprovado' })
+  } catch (error) {
+    console.error('Análise pedido Loja Virtual:', error)
+    res.status(409).json({ error: error.message || 'Não foi possível analisar o pedido.' })
+  }
+})
+
+app.post('/api/loja/rascunhos/:token/finalizar', async (req, res) => {
+  try {
+    if (!firebaseReady) return res.status(503).json({ error: 'Serviço temporariamente indisponível.' })
+    const db = admin.firestore()
+    const ref = publicDraftRef(String(req.params.token))
+    const snap = await ref.get()
+    if (!snap.exists) return res.status(404).json({ error: 'Pedido salvo não encontrado.' })
+    const draft = snap.data()
+    if (draft.status === 'finalizado') return res.json({ ok: true, orderNumber: draft.orderNumber })
+    const settingsSnap = await db.doc('stores/doce-cacau/settings/loja-virtual').get()
+    const s = settingsSnap.exists ? settingsSnap.data() : {}
+    if (s.enabled !== true) return res.status(409).json({ error: 'A loja está temporariamente fechada.' })
+    const customer = sanitizeCustomer(draft.customer)
+    if (!customer.name || customer.phone.replace(/\D/g, '').length < 10) return res.status(400).json({ error: 'Informe nome e telefone válidos.' })
+    if (customer.fulfillment === 'entrega' && (!s.allowDelivery || !customer.address)) return res.status(400).json({ error: 'Entrega indisponível ou endereço incompleto.' })
+    if (customer.fulfillment === 'retirada' && s.allowPickup === false) return res.status(400).json({ error: 'Retirada indisponível.' })
+    if (customer.payment === 'dinheiro' && s.allowCashOnDelivery !== true) return res.status(400).json({ error: 'Pagamento em dinheiro indisponível.' })
+    if (customer.payment === 'pix_antecipado' && (s.allowPixAdvance !== true || !draft.proofFileId)) return res.status(400).json({ error: 'Pix antecipado exige comprovante anexado.' })
+    if (customer.payment === 'cartao' && !(s.allowCardOnDelivery === true || (s.allowCardOnDelivery === undefined && s.allowPixOnDelivery === true))) return res.status(400).json({ error: 'Pagamento com cartão na entrega/retirada indisponível.' })
+    const items = await validatePublicItems(draft.items)
+    const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0)
+    const deliveryFee = customer.fulfillment === 'entrega' ? Math.max(0, Number(s.deliveryFee) || 0) : 0
+    const total = subtotal + deliveryFee
+    const orderNumber = `DC-${String(req.params.token).slice(0, 7).toUpperCase()}`
+    const orderRef = db.doc(`stores/doce-cacau/public_orders/${String(req.params.token)}`)
+    const order = {
+      orderNumber, source: 'loja_virtual', customer, items, subtotal, deliveryFee, total,
+      paymentMethod: customer.payment, paymentStatus: customer.payment === 'pix_antecipado' ? 'Aguardando conferência' : 'Aguardando pagamento',
+      deliveryStatus: 'Aguardando confirmação', proofFileId: draft.proofFileId || null,
+      proofFileName: draft.proofFileName || '', status: 'pendente',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(), draftToken: String(req.params.token)
+    }
+    const result = await db.runTransaction(async tx => {
+      const current = await tx.get(ref)
+      if (!current.exists) throw new Error('Pedido salvo não encontrado.')
+      if (current.data().status === 'finalizado') return { orderNumber: current.data().orderNumber, alreadyFinalized: true }
+      const existingOrder = await tx.get(orderRef)
+      if (!existingOrder.exists) tx.create(orderRef, order)
+      tx.update(ref, { status: 'finalizado', orderNumber, updatedAt: admin.firestore.FieldValue.serverTimestamp() })
+      return { orderNumber, alreadyFinalized: false }
+    })
+    res.status(result.alreadyFinalized ? 200 : 201).json({ ok: true, orderNumber: result.orderNumber })
+  } catch (error) {
+    console.error('Finalização pedido público:', error)
+    res.status(400).json({ error: error.message || 'Não foi possível finalizar o pedido.' })
+  }
+})
+
 
 // Exportação usada pela função serverless da Vercel.
 export default app

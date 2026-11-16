@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { jsPDF } from 'jspdf'
 import {
   LayoutDashboard, Package, ShoppingCart, ClipboardList, Users, BarChart3, Search,
@@ -14,8 +14,11 @@ import {
 } from 'firebase/firestore'
 import Modal from './components/Modal'
 import Scanner from './components/Scanner'
+import LojaVirtual from './loja-virtual/LojaVirtual'
+import PedidosLojaAdmin from './loja-virtual/PedidosLojaAdmin'
+import { defaultLojaVirtualSettings, type LojaVirtualSettings } from './loja-virtual/types'
 
-type Page = 'dashboard'|'products'|'pos'|'orders'|'stock'|'finance'|'reports'|'users'
+type Page = 'dashboard'|'products'|'pos'|'orders'|'stock'|'finance'|'reports'|'users'|'loja'|'pedidos-loja'
 type TeamUser = { uid:string; name:string; email:string; role?:string; active?:boolean; lastLoginAt?:any; createdAt?:any }
 
 function sumOrderPayments(order: Pick<Order,'payments'>): number {
@@ -49,12 +52,15 @@ const nav = [
   {id:'stock',label:'Estoque',icon:PackagePlus},
   {id:'finance',label:'Financeiro',icon:Wallet},
   {id:'reports',label:'Relatórios',icon:BarChart3},
-  {id:'users',label:'Equipe',icon:Users}
+  {id:'users',label:'Equipe',icon:Users},
+  {id:'loja',label:'Loja virtual',icon:Store},
+  {id:'pedidos-loja',label:'Pedidos da loja',icon:ClipboardList}
 ] as const
 const blank: StoreData = { products:[], orders:[], movements:[] }
 
 export default function App() {
   const [data,setData] = useState<StoreData>(loadStore)
+  const [lojaSettings,setLojaSettings] = useState<LojaVirtualSettings>(defaultLojaVirtualSettings)
   const [page,setPage] = useState<Page>('dashboard')
   const [user,setUser] = useState({name:'Administrador',email:'admin@docecacau.local'})
   const [logged,setLogged] = useState(!firebaseReady)
@@ -150,7 +156,10 @@ export default function App() {
       ,
       onSnapshot(collection(db,'stores','doce-cacau','users'), snap=>{
         setTeamUsers(snap.docs.map(d=>({...d.data(),uid:d.id} as TeamUser)).sort((a,b)=>(a.name||'').localeCompare(b.name||'')))
-      }, e=>notify('Erro ao carregar equipe: '+e.message))
+      }, e=>notify('Erro ao carregar equipe: '+e.message)),
+      onSnapshot(doc(db,'stores','doce-cacau','settings','loja-virtual'), snap=>{
+        if(snap.exists()) setLojaSettings({...defaultLojaVirtualSettings,...snap.data()} as LojaVirtualSettings)
+      }, e=>notify('Erro ao carregar configurações da loja: '+e.message))
     ]
     return ()=>unsubs.forEach(unsub=>unsub())
   },[logged])
@@ -167,6 +176,16 @@ export default function App() {
     const timer=window.setInterval(()=>void archiveExpiredProducts(),60*1000)
     return ()=>window.clearInterval(timer)
   },[logged,data.products])
+  const getAdminToken = useCallback(async () => {
+    const token = await auth?.currentUser?.getIdToken()
+    if (!token) throw new Error('Sua sessão expirou. Entre novamente no sistema.')
+    return token
+  }, [])
+  async function saveLojaSettings(settings:LojaVirtualSettings){
+    if(!db || !auth?.currentUser) throw new Error('É necessário estar autenticado para salvar as configurações.')
+    await setDoc(doc(db,'stores','doce-cacau','settings','loja-virtual'),{...settings,updatedAt:serverTimestamp(),updatedBy:auth.currentUser.uid},{merge:true})
+    setLojaSettings(settings)
+  }
   async function persist(next:StoreData) {
     // Mantido apenas como fallback local; no Firebase cada operação grava
     // documentos próprios para evitar sobrescrever o banco inteiro.
@@ -320,6 +339,10 @@ export default function App() {
             if((product as any).archived) throw new Error(`Produto arquivado e indisponível para venda: ${item.name}`)
             if(Number(product.stock)<item.quantity) throw new Error(`Estoque insuficiente: ${item.name}`)
           })
+          const itemsWithCost=cart.map((item,index)=>({
+            ...item,
+            unitCost:Math.max(0,Number((snaps[index].data() as Product).cost)||0)
+          }))
           snaps.forEach((snap,index)=>{
             const item=refs[index].item
             const product=snap.data() as Product
@@ -328,13 +351,18 @@ export default function App() {
             const movement=addMovement({...product,id:snap.id},status==='Reservado'?'Reserva':'Saída',item.quantity,status==='Reservado'?'Reserva de pedido':'Venda no PDV')
             tx.set(doc(db!,'stores','doce-cacau','stock_movements',movement.id),movement)
           })
-          tx.set(doc(db!,'stores','doce-cacau','orders',order.id),{...order,createdBy:auth!.currentUser!.uid,createdByName:user.name,createdAt:order.createdAt,serverCreatedAt:serverTimestamp()})
+          tx.set(doc(db!,'stores','doce-cacau','orders',order.id),{...order,items:itemsWithCost,createdBy:auth!.currentUser!.uid,createdByName:user.name,createdAt:order.createdAt,serverCreatedAt:serverTimestamp()})
         })
       } else {
         for(const i of cart){const p=data.products.find(x=>x.id===i.productId);if(!p||(p as any).archived||p.stock<i.quantity){notify(`Produto indisponível ou estoque insuficiente: ${i.name}`);return}}
+        const itemsWithCost=cart.map(item=>{
+          const product=data.products.find(p=>p.id===item.productId)!
+          return {...item,unitCost:Math.max(0,Number(product.cost)||0)}
+        })
+        const orderWithCost={...order,items:itemsWithCost}
         const products=data.products.map(p=>{const item=cart.find(i=>i.productId===p.id);return item?{...p,stock:p.stock-item.quantity}:p})
         const movements=cart.map(i=>{const p=data.products.find(p=>p.id===i.productId)!;return addMovement(p,status==='Reservado'?'Reserva':'Saída',i.quantity,status==='Reservado'?'Reserva de pedido':'Venda no PDV')})
-        await persist({...data,products,orders:[order,...data.orders],movements:[...movements,...data.movements]})
+        await persist({...data,products,orders:[orderWithCost,...data.orders],movements:[...movements,...data.movements]})
       }
       setCart([]);setModal(null);setPage('pos');notify(status==='Reservado'?'Reserva registrada no Firebase.':'Venda salva no Firebase.')
     } catch(e) { notify((e as Error).message || 'Não foi possível concluir o pedido.') }
@@ -405,12 +433,34 @@ export default function App() {
             const movement=addMovement({...product,id},delta>0?'Entrada':'Saída',Math.abs(delta),`Ajuste por edição da venda ${original.id.slice(0,7)}`)
             tx.set(doc(db!,'stores','doce-cacau','stock_movements',movement.id),movement)
           })
-          tx.update(orderRef,{...patch,subtotal,discount,total,paid:sumOrderPayments(current),paymentStatus:sumOrderPayments(current)>=total-0.001?'Pago':sumOrderPayments(current)>0?'Parcial':'A pagar',updatedAt:serverTimestamp(),updatedBy:auth!.currentUser!.uid,updatedByName:user.name})
+          const itemsWithCost=patch.items.map(item=>{
+            const oldItem=current.items.find(existing=>existing.productId===item.productId)
+            const oldQuantity=oldQty.get(item.productId)||0
+            const newQuantity=newQty.get(item.productId)||0
+            const productIndex=refs.findIndex(ref=>ref.id===item.productId)
+            const product=snaps[productIndex].data() as Product
+            const unitCost=oldItem&&oldQuantity===newQuantity&&oldItem.unitCost!==undefined
+              ?Number(oldItem.unitCost)
+              :Math.max(0,Number(product.cost)||0)
+            return {...item,unitCost}
+          })
+          tx.update(orderRef,{...patch,items:itemsWithCost,subtotal,discount,total,paid:sumOrderPayments(current),paymentStatus:sumOrderPayments(current)>=total-0.001?'Pago':sumOrderPayments(current)>0?'Parcial':'A pagar',updatedAt:serverTimestamp(),updatedBy:auth!.currentUser!.uid,updatedByName:user.name})
         })
       }else{
+        const itemsWithCost=patch.items.map(item=>{
+          const oldItem=original.items.find(existing=>existing.productId===item.productId)
+          const oldQuantity=oldQty.get(item.productId)||0
+          const newQuantity=newQty.get(item.productId)||0
+          const product=data.products.find(p=>p.id===item.productId)!
+          const unitCost=oldItem&&oldQuantity===newQuantity&&oldItem.unitCost!==undefined
+            ?Number(oldItem.unitCost)
+            :Math.max(0,Number(product.cost)||0)
+          return {...item,unitCost}
+        })
+        const updatedWithCost={...updated,items:itemsWithCost}
         const products=data.products.map(p=>{const delta=(oldQty.get(p.id)||0)-(newQty.get(p.id)||0);return delta?{...p,stock:p.stock+delta}:p})
         const movements=productIds.flatMap(id=>{const delta=(oldQty.get(id)||0)-(newQty.get(id)||0);const p=data.products.find(x=>x.id===id);return delta&&p?[addMovement(p,delta>0?'Entrada':'Saída',Math.abs(delta),`Ajuste por edição da venda ${original.id.slice(0,7)}`)]:[]})
-        await persist({...data,products,orders:data.orders.map(o=>o.id===original.id?updated:o),movements:[...movements,...data.movements]})
+        await persist({...data,products,orders:data.orders.map(o=>o.id===original.id?updatedWithCost:o),movements:[...movements,...data.movements]})
       }
       setOrderEditor(null);notify('Venda atualizada e estoque ajustado.')
     }catch(e){notify('Não foi possível editar a venda: '+(e as Error).message)}
@@ -521,6 +571,47 @@ export default function App() {
     return data.orders.filter(o=>o.isCanceled&&isWithinReportPeriod(o.canceledAt||o.createdAt))
       .sort((a,b)=>(b.canceledAt||b.createdAt).localeCompare(a.canceledAt||a.createdAt))
   }
+  function getProfitReport(orders:Order[]){
+    const products=new Map<string,{productId:string;name:string;quantity:number;revenue:number;cost:number;profit:number;estimatedQuantity:number;missingQuantity:number}>()
+    let productRevenue=0,totalCost=0,estimatedQuantity=0,missingQuantity=0
+    for(const order of orders){
+      const lineSubtotal=order.items.reduce((sum,item)=>sum+Math.max(0,Number(item.unitPrice)||0)*Math.max(0,Number(item.quantity)||0),0)
+      const recordedSubtotal=Number.isFinite(Number(order.subtotal))?Number(order.subtotal):lineSubtotal
+      const discount=Math.max(0,Number(order.discount)||Math.max(0,lineSubtotal-recordedSubtotal))
+      for(const item of order.items){
+        const quantity=Math.max(0,Number(item.quantity)||0)
+        const lineGross=Math.max(0,Number(item.unitPrice)||0)*quantity
+        const allocatedDiscount=lineSubtotal>0?discount*(lineGross/lineSubtotal):0
+        const revenue=Math.max(0,lineGross-allocatedDiscount)
+        const product=data.products.find(p=>p.id===item.productId)
+        const hasSnapshot=item.unitCost!==undefined&&item.unitCost!==null&&Number.isFinite(Number(item.unitCost))
+        const hasCurrentCost=!!product&&Number.isFinite(Number(product.cost))
+        const hasCost=hasSnapshot||hasCurrentCost
+        const unitCost=hasSnapshot?Math.max(0,Number(item.unitCost)):hasCurrentCost?Math.max(0,Number(product!.cost)):0
+        const cost=hasCost?unitCost*quantity:0
+        const estimated=!hasSnapshot&&hasCurrentCost
+        productRevenue+=revenue
+        totalCost+=cost
+        if(estimated)estimatedQuantity+=quantity
+        if(!hasCost)missingQuantity+=quantity
+        const row=products.get(item.productId)||{productId:item.productId,name:item.name||product?.name||'Produto',quantity:0,revenue:0,cost:0,profit:0,estimatedQuantity:0,missingQuantity:0}
+        row.quantity+=quantity
+        row.revenue+=revenue
+        row.cost+=cost
+        row.profit+=hasCost?revenue-cost:0
+        if(estimated)row.estimatedQuantity+=quantity
+        if(!hasCost)row.missingQuantity+=quantity
+        products.set(item.productId,row)
+      }
+    }
+    const profit=missingQuantity>0?null:productRevenue-totalCost
+    return {
+      productRevenue,totalCost,profit,
+      margin:profit===null||productRevenue<=0?null:(profit/productRevenue)*100,
+      estimatedQuantity,missingQuantity,
+      products:[...products.values()].sort((a,b)=>b.profit-a.profit)
+    }
+  }
   async function exportProductCatalogPdf(){
     const availableProducts=activeProducts
       .filter(p=>Number(p.stock)>0)
@@ -623,6 +714,14 @@ export default function App() {
       ['Período',reportFrom||'Desde o início','até',reportTo||'Hoje'],
       ['Vendas válidas',gross,'Estornos',canceled,'Vendas líquidas',gross-canceled],
       [],
+      ['CUSTO E LUCRO DOS PRODUTOS'],
+      ['Venda líquida de produtos',getProfitReport(orders).productRevenue,'Custo dos produtos vendidos',getProfitReport(orders).totalCost,'Lucro bruto',getProfitReport(orders).profit??'Incompleto','Margem (%)',getProfitReport(orders).margin??'Incompleta'],
+      ['Quantidade com custo atual estimado',getProfitReport(orders).estimatedQuantity,'Quantidade sem custo disponível',getProfitReport(orders).missingQuantity],
+      [],
+      ['LUCRO POR PRODUTO'],
+      ['Produto','Quantidade','Venda líquida','Custo','Lucro','Unidades estimadas','Unidades sem custo'],
+      ...getProfitReport(orders).products.map(p=>[p.name,p.quantity,p.revenue,p.cost,p.missingQuantity?'Incompleto':p.profit,p.estimatedQuantity,p.missingQuantity]),
+      [],
       ['VENDAS'],
       ['Pedido','Data','Cliente','Vendedor','Total do pedido','Total recebido','Saldo pendente','Status pagamento','Entrega'],
       ...orders.map(o=>[o.id,new Date(o.createdAt).toLocaleString('pt-BR'),o.customer,o.seller,o.total,sumOrderPayments(o),Math.max(0,o.total-sumOrderPayments(o)),o.paymentStatus,o.deliveryStatus]),
@@ -654,6 +753,7 @@ export default function App() {
     const net=sold-canceled
     const received=receipts.reduce((s,p)=>s+p.amount,0)
     const pending=orders.reduce((s,o)=>s+Math.max(0,o.total-sumOrderPayments(o)),0)
+    const profitReport=getProfitReport(orders)
     const docPdf=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'})
     const pageW=297, pageH=210, margin=15
     const brown: [number, number, number]=[91,58,43], muted: [number, number, number]=[145,119,104], cream: [number, number, number]=[250,244,238], gold: [number, number, number]=[190,145,111]
@@ -689,6 +789,11 @@ export default function App() {
     metric(margin+134,'VENDAS LÍQUIDAS',currency(net))
     metric(margin+201,'TOTAL RECEBIDO',currency(received))
     y+=31
+    metric(margin,'CUSTO DOS PRODUTOS',currency(profitReport.totalCost))
+    metric(margin+67,'LUCRO BRUTO',profitReport.profit===null?'INCOMPLETO':currency(profitReport.profit))
+    metric(margin+134,'MARGEM BRUTA',profitReport.margin===null?'—':`${profitReport.margin.toFixed(1)}%`)
+    metric(margin+201,'CUSTO ESTIMADO',String(profitReport.estimatedQuantity))
+    y+=31
     const section=(title:string)=>{
       if(y>pageH-28){addFooter(page);docPdf.addPage();page++;addHeader(true);y=48}
       docPdf.setFont('helvetica','bold');docPdf.setFontSize(11);docPdf.setTextColor(...brown);docPdf.text(title,margin,y);y+=7
@@ -706,6 +811,15 @@ export default function App() {
       }
       drawRow(headers,true);rows.forEach(row=>drawRow(row))
       y+=5
+    }
+    section('LUCRO POR PRODUTO')
+    table(['Produto','Qtd.','Venda liquida','Custo','Lucro'],
+      profitReport.products.map(p=>[p.name,String(p.quantity),currency(p.revenue),currency(p.cost),p.missingQuantity?'Incompleto':currency(p.profit)]),
+      [75,18,48,48,48])
+    if(profitReport.estimatedQuantity||profitReport.missingQuantity){
+      docPdf.setFont('helvetica','normal');docPdf.setFontSize(7);docPdf.setTextColor(...muted)
+      docPdf.text(`Unidades com custo atual estimado: ${profitReport.estimatedQuantity} | Unidades sem custo disponivel: ${profitReport.missingQuantity}`,margin,y)
+      y+=7
     }
     section('VENDAS')
     table(['Pedido','Data','Cliente','Vendedor','Total','Recebido','Pendente','Pagamento','Entrega'],
@@ -797,6 +911,7 @@ export default function App() {
         const canceled=cancellations.reduce((s,o)=>s+o.total,0)
         const net=sold-canceled
         const pending=orders.reduce((s,o)=>s+Math.max(0,o.total-sumOrderPayments(o)),0)
+        const profitReport=getProfitReport(orders)
         const methods=receipts.reduce((a,p)=>{a[p.method]=(a[p.method]||0)+p.amount;return a},{} as Record<string,number>)
         const sellers=orders.reduce((a,o)=>{a[o.seller]??={count:0,total:0,received:0};a[o.seller].count++;a[o.seller].total+=o.total;a[o.seller].received+=sumOrderPayments(o);return a},{} as Record<string,{count:number,total:number,received:number}>)
         return <div className="reports-print-area">
@@ -811,6 +926,19 @@ export default function App() {
           <div className="stats-grid">
             <Stat icon={<AlertTriangle/>} label="Saldo a receber" value={money(pending)} hint="Somente pedidos não estornados"/>
             <Stat icon={<CalendarDays/>} label="Pedidos entregues" value={String(orders.filter(o=>o.deliveryStatus==='Entregue').length)} hint="Entregas concluídas"/>
+          </div>
+          <div className="stats-grid">
+            <Stat icon={<Package/>} label="Custo dos produtos" value={money(profitReport.totalCost)} hint="Custo histórico ou estimado"/>
+            <Stat icon={<TrendingUp/>} label="Lucro bruto" value={profitReport.profit===null?'Incompleto':money(profitReport.profit)} hint={profitReport.missingQuantity?'Há itens sem custo disponível':'Venda líquida dos produtos menos custos'}/>
+            <Stat icon={<BarChart3/>} label="Margem bruta" value={profitReport.margin===null?'—':`${profitReport.margin.toFixed(1).replace('.',',')}%`} hint="Lucro bruto ÷ venda líquida dos produtos"/>
+            <Stat icon={<AlertTriangle/>} label="Custo estimado" value={`${profitReport.estimatedQuantity} un.`} hint={`${profitReport.missingQuantity} un. sem custo disponível`}/>
+          </div>
+          <div className="panel">
+            <div className="panel-title"><div><h2>Lucro por produto</h2><p>Venda líquida, custo e lucro dos itens vendidos no período.</p></div></div>
+            {profitReport.products.length?<div className="table-wrap"><table><thead><tr><th>Produto</th><th>Quantidade</th><th>Venda líquida</th><th>Custo</th><th>Lucro</th></tr></thead><tbody>
+              {profitReport.products.map(p=><tr key={p.productId}><td><b>{p.name}</b>{p.estimatedQuantity>0&&<small>Custo atual estimado em {p.estimatedQuantity} unidade(s)</small>}{p.missingQuantity>0&&<small>Sem custo cadastrado para {p.missingQuantity} unidade(s)</small>}</td><td>{p.quantity}</td><td>{money(p.revenue)}</td><td>{money(p.cost)}</td><td><b>{p.missingQuantity?'Incompleto':money(p.profit)}</b></td></tr>)}
+            </tbody></table></div>:<Empty text="Nenhuma venda de produto neste período."/>}
+            {(profitReport.estimatedQuantity>0||profitReport.missingQuantity>0)&&<p className="muted-note">Vendas antigas sem custo histórico usam o custo atual do cadastro como estimativa. Itens sem custo disponível não entram no cálculo do lucro total.</p>}
           </div>
           <div className="grid-two report-grids">
             <div className="panel"><div className="panel-title"><div><h2>Recebimentos por forma de pagamento</h2><p>Valores registrados no período</p></div></div>
@@ -839,6 +967,8 @@ export default function App() {
           </div>
         </div>
       })()}
+      {page==='loja'&&<LojaVirtual initialSettings={lojaSettings} onSave={saveLojaSettings}/> }
+      {page==='pedidos-loja'&&<PedidosLojaAdmin getToken={getAdminToken}/>}
       {page==='users'&&<><PageHeading title="Equipe" desc="Todos os integrantes têm perfil de administrador e acesso aos mesmos dados."/>
         <div className="panel" id="team-profile">
           <div className="panel-title"><div><h2>{selectedTeamUser?.uid===auth?.currentUser?.uid?'Meu perfil':selectedTeamUser?'Editar administrador':'Editar perfil'}</h2><p>{selectedTeamUser?'Altere o nome que aparece nos registros e na equipe.':'Selecione um usuário na lista abaixo para editar seu nome.'}</p></div></div>
@@ -915,20 +1045,32 @@ function ProductForm({product,onClose,onSave,onScan,scannedBarcode,onLookup,noti
  const [uploadingImage,setUploadingImage]=useState(false)
  const [driveConnected,setDriveConnected]=useState<boolean|null>(null)
  const [drivePreview,setDrivePreview]=useState('')
+ const [drivePreview2,setDrivePreview2]=useState('')
  useEffect(()=>{
-   let active=true;let objectUrl=''
-   if(p.driveFileId){
-     auth.currentUser?.getIdToken().then(token=>fetch(`/api/drive/image/${encodeURIComponent(p.driveFileId!)}`,{headers:{Authorization:`Bearer ${token}`}})).then(async response=>{if(!response.ok)throw new Error('Não foi possível carregar a foto.');return response.blob()}).then(blob=>{if(!active)return;objectUrl=URL.createObjectURL(blob);setDrivePreview(objectUrl)}).catch(()=>{if(active)setDrivePreview('')})
-   }else setDrivePreview('')
-   return ()=>{active=false;if(objectUrl)URL.revokeObjectURL(objectUrl)}
- },[p.driveFileId])
+   let active=true;const objectUrls:string[]=[]
+   const loadPreview=async(fileId:string|undefined,setPreview:(value:string)=>void)=>{
+     if(!fileId){setPreview('');return}
+     try{
+       const token=await auth.currentUser?.getIdToken()
+       if(!token)throw new Error('Sessão não encontrada.')
+       const response=await fetch(`/api/drive/image/${encodeURIComponent(fileId)}`,{headers:{Authorization:`Bearer ${token}`}})
+       if(!response.ok)throw new Error('Não foi possível carregar a foto.')
+       const blob=await response.blob()
+       if(!active)return
+       const url=URL.createObjectURL(blob);objectUrls.push(url);setPreview(url)
+     }catch{if(active)setPreview('')}
+   }
+   void loadPreview(p.driveFileId,setDrivePreview)
+   void loadPreview(p.driveFileId2,setDrivePreview2)
+   return ()=>{active=false;objectUrls.forEach(url=>URL.revokeObjectURL(url))}
+ },[p.driveFileId,p.driveFileId2])
  useEffect(()=>{if(scannedBarcode)setP(x=>({...x,barcode:scannedBarcode}))},[scannedBarcode])
  useEffect(()=>{let active=true;auth.currentUser?.getIdToken().then(token=>fetch('/api/drive/status',{headers:{Authorization:`Bearer ${token}`}})).then(r=>r?.ok?r.json():null).then(v=>{if(active&&v) setDriveConnected(Boolean(v.connected))}).catch(()=>{});return()=>{active=false}},[])
  async function connectDrive(){try{const token=await auth.currentUser?.getIdToken();if(!token)throw new Error('Entre novamente no sistema.');const r=await fetch('/api/drive/connect',{headers:{Authorization:`Bearer ${token}`}});const v=await r.json();if(!r.ok)throw new Error(v.error||'Falha ao iniciar conexão.');window.open(v.url,'_blank','noopener,noreferrer')}catch(e){notify((e as Error).message)}}
- async function uploadProductImage(file?:File){if(!file)return;try{setUploadingImage(true);const token=await auth.currentUser?.getIdToken();if(!token)throw new Error('Entre novamente no sistema.');const body=new FormData();body.append('image',file);body.append('productId',p.id);const r=await fetch('/api/drive/upload',{method:'POST',headers:{Authorization:`Bearer ${token}`},body});const v=await r.json();if(!r.ok)throw new Error(v.error||'Falha ao enviar foto.');setP(x=>({...x,image:'',driveFileId:v.fileId}));setDriveConnected(true);notify('Foto enviada ao Google Drive.')}catch(e){notify((e as Error).message)}finally{setUploadingImage(false)}}
+ async function uploadProductImage(file?:File,slot:'principal'|'adicional'='principal'){if(!file)return;try{setUploadingImage(true);const token=await auth.currentUser?.getIdToken();if(!token)throw new Error('Entre novamente no sistema.');const body=new FormData();body.append('image',file);body.append('productId',p.id);body.append('slot',slot);const r=await fetch('/api/drive/upload',{method:'POST',headers:{Authorization:`Bearer ${token}`},body});const v=await r.json();if(!r.ok)throw new Error(v.error||'Falha ao enviar foto.');setP(x=>slot==='principal'?({...x,image:'',driveFileId:v.fileId}):({...x,driveFileId2:v.fileId}));setDriveConnected(true);notify(slot==='principal'?'Foto principal enviada ao Google Drive.':'Foto adicional enviada ao Google Drive.')}catch(e){notify((e as Error).message)}finally{setUploadingImage(false)}}
  async function lookup(){if(!p.barcode){notify('Informe ou leia o código primeiro.');return}setLoading(true);const found=await onLookup(p.barcode);if(found){setP(x=>({...x,name:x.name||found.name,brand:x.brand||found.brand,image:x.image||found.image}));notify('Dados encontrados. Confira antes de salvar.')}else notify('Não encontramos esse código. Preencha manualmente.');setLoading(false)}
  function field(k:keyof Product,label:string,type='text'){return <label>{label}{(k==='cost'||k==='price')?<CurrencyInput value={Number(p[k])||0} onChange={v=>setP(x=>({...x,[k]:v}))}/>:<input type={type} value={String(p[k]??'')} onChange={e=>setP(x=>({...x,[k]:type==='number'?Number(e.target.value):e.target.value}))}/>}</label>}
- return <Modal title={product?'Editar produto':'Cadastrar produto'} onClose={onClose} wide><div className="product-image-upload"><div className="product-image-preview">{(drivePreview||p.image)?<img src={drivePreview||p.image} alt={p.name||'Foto do produto'}/>:<Package size={28}/>}</div><div className="product-image-actions"><b>Foto do produto</b><small>{driveConnected===false?'Conecte o Google Drive para compartilhar as fotos entre os administradores.':'A foto ficará compartilhada pelo Google Drive.'}</small><label className="secondary upload-image-button">{uploadingImage?'Enviando foto...':'Escolher foto'}<input type="file" accept="image/*" disabled={uploadingImage} onChange={e=>uploadProductImage(e.target.files?.[0])}/></label>{driveConnected!==true&&<button type="button" className="secondary" onClick={connectDrive}>Conectar Google Drive</button>}</div></div><div className="form-grid">{field('name','Nome do produto')}{field('category','Categoria')}{field('brand','Marca') }<div className="barcode-field"><label>Código de barras<input value={p.barcode} onChange={e=>setP(x=>({...x,barcode:e.target.value}))} placeholder="EAN / GTIN"/></label><button className="secondary" onClick={onScan}><ScanBarcode size={17}/></button><button className="secondary" onClick={lookup} disabled={loading}><Search size={17}/>{loading?'Buscando':'Buscar'}</button></div>{field('cost','Preço de custo','number')}{field('price','Preço de venda','number')}{field('stock','Estoque inicial','number')}{field('minStock','Estoque mínimo','number')}{field('expiry','Validade','date')}</div><div className="modal-actions"><button className="secondary" onClick={onClose}>Cancelar</button><button className="primary" onClick={()=>{if(!p.name.trim()){notify('Informe o nome do produto.');return}onSave(p)}}>Salvar produto</button></div></Modal>
+ return <Modal title={product?'Editar produto':'Cadastrar produto'} onClose={onClose} wide><div className="product-image-gallery-form"><div className="product-image-upload"><div className="product-image-preview">{(drivePreview||p.image)?<img src={drivePreview||p.image} alt={p.name||'Foto principal do produto'}/>:<Package size={28}/>}</div><div className="product-image-actions"><b>Foto 1 — Produto fechado</b><small>{driveConnected===false?'Conecte o Google Drive para compartilhar as fotos entre os administradores.':'Imagem principal exibida no catálogo.'}</small><label className="secondary upload-image-button">{uploadingImage?'Enviando foto...':'Escolher foto principal'}<input type="file" accept="image/*" disabled={uploadingImage} onChange={e=>uploadProductImage(e.target.files?.[0],'principal')}/></label></div></div><div className="product-image-upload"><div className="product-image-preview">{drivePreview2?<img src={drivePreview2} alt={p.name||'Foto adicional do produto'}/>:<Package size={28}/>}</div><div className="product-image-actions"><b>Foto 2 — Produto aberto</b><small>Imagem adicional para mostrar o interior ou detalhes do produto.</small><label className="secondary upload-image-button">{uploadingImage?'Enviando foto...':p.driveFileId2?'Substituir foto adicional':'Adicionar segunda foto'}<input type="file" accept="image/*" disabled={uploadingImage} onChange={e=>uploadProductImage(e.target.files?.[0],'adicional')}/></label></div></div>{driveConnected!==true&&<button type="button" className="secondary" onClick={connectDrive}>Conectar Google Drive</button>}</div><div className="form-grid">{field('name','Nome do produto')}{field('category','Categoria')}{field('brand','Marca') }<div className="barcode-field"><label>Código de barras<input value={p.barcode} onChange={e=>setP(x=>({...x,barcode:e.target.value}))} placeholder="EAN / GTIN"/></label><button className="secondary" onClick={onScan}><ScanBarcode size={17}/></button><button className="secondary" onClick={lookup} disabled={loading}><Search size={17}/>{loading?'Buscando':'Buscar'}</button></div>{field('cost','Preço de custo','number')}{field('price','Preço de venda','number')}{field('stock','Estoque inicial','number')}{field('minStock','Estoque mínimo','number')}{field('expiry','Validade','date')}</div><div className="modal-actions"><button className="secondary" onClick={onClose}>Cancelar</button><button className="primary" onClick={()=>{if(!p.name.trim()){notify('Informe o nome do produto.');return}onSave(p)}}>Salvar produto</button></div></Modal>
 }
 function StockForm({product,onClose,onSave}:{product:Product;onClose:()=>void;onSave:(p:Product,q:number,d:string)=>void}){
  const [qty,setQty]=useState(1);const [detail,setDetail]=useState('Reposição de mercadoria')
