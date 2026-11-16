@@ -10,7 +10,7 @@ type PublicOrder = {
   proofFileId?: string|null; proofFileName?: string; createdAt?: { _seconds?: number; seconds?: number }|string
   rejectionReason?: string
 }
-type Props = { getToken: () => Promise<string> }
+type Props = { getToken: () => Promise<string>; onPendingCountChange?: (count:number) => void }
 const money = (v:number) => (Number(v)||0).toLocaleString('pt-BR',{style:'currency',currency:'BRL'})
 const dateLabel = (v:PublicOrder['createdAt']) => {
   if (!v) return 'Data não informada'
@@ -23,7 +23,7 @@ type ReviewDialog = {
   order: PublicOrder
   action: 'aprovar' | 'recusar'
 }
-export default function PedidosLojaAdmin({getToken}:Props) {
+export default function PedidosLojaAdmin({getToken,onPendingCountChange}:Props) {
   const [orders,setOrders] = useState<PublicOrder[]>([])
   const [loading,setLoading] = useState(true)
   const [error,setError] = useState('')
@@ -35,9 +35,9 @@ export default function PedidosLojaAdmin({getToken}:Props) {
   const [reviewReason,setReviewReason] = useState('')
   const load = useCallback(async()=>{
     setLoading(true);setError('')
-    try { const token=await getToken();const r=await fetch('/api/loja/admin/pedidos',{headers:{Authorization:`Bearer ${token}`}});const j=await r.json();if(!r.ok)throw new Error(j.error||'Falha ao carregar pedidos.');setOrders(j.orders||[]) }
+    try { const token=await getToken();const r=await fetch('/api/loja/admin/pedidos',{headers:{Authorization:`Bearer ${token}`}});const j=await r.json();if(!r.ok)throw new Error(j.error||'Falha ao carregar pedidos.');setOrders(j.orders||[]);onPendingCountChange?.((j.orders||[]).filter((o:PublicOrder)=>o.status==='pendente').length) }
     catch(e){setError(e instanceof Error?e.message:'Falha ao carregar pedidos.')} finally {setLoading(false)}
-  },[getToken])
+  },[getToken,onPendingCountChange])
   useEffect(()=>{void load()},[load])
 
   useEffect(()=>{

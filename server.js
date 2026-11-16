@@ -108,6 +108,39 @@ async function consumeOAuthState(state) {
   oauthStates.delete(state)
   return value
 }
+async function notifyAdminsOfNewPublicOrder(orderNumber) {
+  if (!firebaseReady) return
+  try {
+    const db = admin.firestore()
+    const users = await db.collection('stores/doce-cacau/users').where('active', '==', true).get()
+    const tokens = []
+    for (const userDoc of users.docs) {
+      const tokenDocs = await userDoc.ref.collection('push_tokens').get()
+      tokenDocs.forEach(tokenDoc => {
+        const value = String(tokenDoc.data()?.token || '')
+        if (value) tokens.push({ token: value, ref: tokenDoc.ref })
+      })
+    }
+    for (let offset = 0; offset < tokens.length; offset += 500) {
+      const batch = tokens.slice(offset, offset + 500)
+      const result = await admin.messaging().sendEachForMulticast({
+        tokens: batch.map(item => item.token),
+        // Dados mínimos: não incluir dados pessoais nem conteúdo do pedido.
+        data: { title: 'Novo pedido · Doce Cacau', body: `O pedido ${String(orderNumber)} está aguardando atendimento.`, orderNumber: String(orderNumber), type: 'new_public_order' },
+        webpush: { headers: { Urgency: 'high', TTL: '86400' } }
+      })
+      const invalid = []
+      result.responses.forEach((response, index) => {
+        if (!response.success && ['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'].includes(response.error?.code)) invalid.push(batch[index].ref.delete())
+      })
+      if (invalid.length) await Promise.all(invalid)
+    }
+  } catch (error) {
+    // A falha de push nunca deve impedir a confirmação do pedido do cliente.
+    console.error('Falha ao enviar push de novo pedido:', error.message)
+  }
+}
+
 async function requireUser(req, res, next) {
   try {
     if (!firebaseReady) return res.status(503).json({ error: 'Serviço de autenticação indisponível. Verifique as variáveis de ambiente da API.' })
@@ -416,7 +449,35 @@ app.post('/api/loja/rascunhos/:token/comprovante', upload.single('proof'), async
   }
 })
 
+// Registro seguro do dispositivo autenticado para receber notificações administrativas.
+app.post('/api/admin/push-token', requireUser, async (req, res) => {
+  try {
+    const token = String(req.body.token || '').trim()
+    if (token.length < 40 || token.length > 4096) return res.status(400).json({ error: 'Token de notificações inválido.' })
+    const memberRef = admin.firestore().doc(`stores/doce-cacau/users/${req.user.uid}`)
+    const member = await memberRef.get()
+    if (!member.exists || member.data()?.active !== true) return res.status(403).json({ error: 'Usuário sem acesso ativo.' })
+    const tokenId = createHash('sha256').update(token).digest('hex')
+    await memberRef.collection('push_tokens').doc(tokenId).set({ token, platform: 'web', updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true })
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({ ok: true })
+  } catch (error) {
+    console.error('Registro token push:', error)
+    res.status(500).json({ error: 'Não foi possível registrar as notificações neste dispositivo.' })
+  }
+})
+
 // Painel administrativo dos pedidos recebidos pela Loja Virtual.
+app.get('/api/loja/admin/pedidos/contagem', requireUser, async (_req, res) => {
+  try {
+    const snapshot = await admin.firestore().collection('stores/doce-cacau/public_orders').where('status', '==', 'pendente').count().get()
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({ pending: snapshot.data().count || 0 })
+  } catch (error) {
+    console.error('Contagem pedidos pendentes:', error)
+    res.status(500).json({ error: 'Não foi possível consultar a contagem de pedidos.' })
+  }
+})
 app.get('/api/loja/admin/pedidos', requireUser, async (_req, res) => {
   try {
     const snap = await admin.firestore().collection('stores/doce-cacau/public_orders').get()
@@ -579,6 +640,7 @@ app.post('/api/loja/rascunhos/:token/finalizar', async (req, res) => {
       tx.update(ref, { status: 'finalizado', orderNumber, updatedAt: admin.firestore.FieldValue.serverTimestamp() })
       return { orderNumber, alreadyFinalized: false }
     })
+    if (!result.alreadyFinalized) await notifyAdminsOfNewPublicOrder(result.orderNumber)
     res.status(result.alreadyFinalized ? 200 : 201).json({ ok: true, orderNumber: result.orderNumber })
   } catch (error) {
     console.error('Finalização pedido público:', error)

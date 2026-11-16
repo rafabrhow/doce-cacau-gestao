@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { jsPDF } from 'jspdf'
 import {
-  LayoutDashboard, Package, ShoppingCart, ClipboardList, Users, BarChart3, Search,
+  LayoutDashboard, Package, ShoppingCart, ClipboardList, Users, BarChart3, Search, Bell,
   Plus, ScanBarcode, LogOut, Menu, X, TrendingUp, AlertTriangle, Wallet,
   CalendarDays, Trash2, Check, Pencil, Minus, RefreshCw, PackagePlus, Store, FileSpreadsheet, FileText, Eye, Undo2
 } from 'lucide-react'
 import type { Movement, Order, OrderItem, PaymentRecord, Product, StoreData } from './types'
 import { dateNow, loadStore, money, saveStore, uid } from './lib/store'
-import { auth, db, firebaseReady, teamAuth } from './lib/firebase'
+import { auth, db, firebaseReady, teamAuth, enableAdminPush } from './lib/firebase'
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut, createUserWithEmailAndPassword, updateProfile } from 'firebase/auth'
 import {
   collection, onSnapshot, setDoc, doc, getDoc, runTransaction, serverTimestamp
@@ -61,7 +61,10 @@ const blank: StoreData = { products:[], orders:[], movements:[] }
 export default function App() {
   const [data,setData] = useState<StoreData>(loadStore)
   const [lojaSettings,setLojaSettings] = useState<LojaVirtualSettings>(defaultLojaVirtualSettings)
-  const [page,setPage] = useState<Page>('dashboard')
+  const [newPublicOrders,setNewPublicOrders] = useState(0)
+  const [pushBusy,setPushBusy] = useState(false)
+  const [pushEnabled,setPushEnabled] = useState(false)
+  const [page,setPage] = useState<Page>(() => new URLSearchParams(window.location.search).get('page') === 'pedidos-loja' ? 'pedidos-loja' : 'dashboard')
   const [user,setUser] = useState({name:'Administrador',email:'admin@docecacau.local'})
   const [logged,setLogged] = useState(!firebaseReady)
   const [loginEmail,setLoginEmail] = useState('')
@@ -181,6 +184,37 @@ export default function App() {
     if (!token) throw new Error('Sua sessão expirou. Entre novamente no sistema.')
     return token
   }, [])
+  const refreshNewPublicOrders = useCallback(async () => {
+    if (!auth?.currentUser) return
+    try {
+      const token = await getAdminToken()
+      const response = await fetch('/api/loja/admin/pedidos/contagem', { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' })
+      if (response.ok) { const result = await response.json(); setNewPublicOrders(Math.max(0, Number(result.pending) || 0)) }
+    } catch (error) { console.warn('Não foi possível atualizar a contagem de novos pedidos:', error) }
+  }, [getAdminToken])
+  useEffect(() => {
+    if (!logged || !auth?.currentUser) { setNewPublicOrders(0); return }
+    void refreshNewPublicOrders()
+    const timer = window.setInterval(() => void refreshNewPublicOrders(), 20000)
+    return () => window.clearInterval(timer)
+  }, [logged, refreshNewPublicOrders])
+  useEffect(() => { if (page === 'pedidos-loja') void refreshNewPublicOrders() }, [page, refreshNewPublicOrders])
+  async function activatePushNotifications() {
+    setPushBusy(true)
+    try {
+      const pushToken = await enableAdminPush()
+      const idToken = await getAdminToken()
+      const response = await fetch('/api/admin/push-token', {
+        method: 'POST', headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: pushToken })
+      })
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(result.error || 'Não foi possível registrar este dispositivo.')
+      setPushEnabled(true)
+      notify('Notificações ativadas neste dispositivo.')
+    } catch (error) { notify(error instanceof Error ? error.message : 'Falha ao ativar notificações.') }
+    finally { setPushBusy(false) }
+  }
   async function saveLojaSettings(settings:LojaVirtualSettings){
     if(!db || !auth?.currentUser) throw new Error('É necessário estar autenticado para salvar as configurações.')
     await setDoc(doc(db,'stores','doce-cacau','settings','loja-virtual'),{...settings,updatedAt:serverTimestamp(),updatedBy:auth.currentUser.uid},{merge:true})
@@ -854,9 +888,9 @@ export default function App() {
   }
 
   return <div className="app-shell">
-    <aside className={`sidebar ${mobileOpen?'open':''}`}><div className="brand"><img src="/logo-doce-cacau.jpeg"/><button className="mobile-close" onClick={()=>setMobileOpen(false)}><X/></button></div><div className="store-label"><Store size={15}/> PAINEL DA CHOCOLATERIA</div><nav>{nav.map(n=>{const Icon=n.icon;return <button key={n.id} className={page===n.id?'nav-item active':'nav-item'} onClick={()=>{setPage(n.id);setMobileOpen(false);setSearch('')}}><Icon size={19}/>{n.label}{n.id==='orders'&&data.orders.some(o=>o.deliveryStatus==='Reservado')&&<i/>}</button>})}</nav><div className="sidebar-bottom"><div className="user-chip"><div className="avatar">{user.name.slice(0,1).toUpperCase()}</div><div><b>{user.name}</b><small>{user.email}</small></div></div><button className="nav-item" onClick={logout}><LogOut size={18}/> Sair</button></div></aside>
+    <aside className={`sidebar ${mobileOpen?'open':''}`}><div className="brand"><img src="/logo-doce-cacau.jpeg"/>{newPublicOrders>0&&<button className="dc-new-orders-badge" title={`${newPublicOrders} pedido(s) novo(s) aguardando atendimento`} onClick={()=>setPage('pedidos-loja')}>{newPublicOrders>99?'99+':newPublicOrders}</button>}<button className="mobile-close" onClick={()=>setMobileOpen(false)}><X/></button></div><div className="store-label"><Store size={15}/> PAINEL DA CHOCOLATERIA</div><nav>{nav.map(n=>{const Icon=n.icon;return <button key={n.id} className={page===n.id?'nav-item active':'nav-item'} onClick={()=>{setPage(n.id);setMobileOpen(false);setSearch('')}}><Icon size={19}/>{n.label}{n.id==='pedidos-loja'&&newPublicOrders>0&&<span className="nav-count-badge">{newPublicOrders>99?'99+':newPublicOrders}</span>}{n.id==='orders'&&data.orders.some(o=>o.deliveryStatus==='Reservado')&&<i/>}</button>})}</nav><div className="sidebar-bottom"><div className="user-chip"><div className="avatar">{user.name.slice(0,1).toUpperCase()}</div><div><b>{user.name}</b><small>{user.email}</small></div></div><button className="nav-item" onClick={logout}><LogOut size={18}/> Sair</button></div></aside>
     {mobileOpen&&<div className="mobile-scrim" onClick={()=>setMobileOpen(false)}/>}
-    <main className="main"><header className="topbar"><button className="icon-btn menu-toggle" onClick={()=>setMobileOpen(true)}><Menu/></button><div><span className="eyebrow">DOCE CACAU /</span><b>{nav.find(n=>n.id===page)?.label}</b></div><div className="top-actions"><div className="avatar" title={user.name}>{user.name.slice(0,1).toUpperCase()}</div></div></header>
+    <main className="main"><header className="topbar"><button className="icon-btn menu-toggle" onClick={()=>setMobileOpen(true)}><Menu/></button><div><span className="eyebrow">DOCE CACAU /</span><b>{nav.find(n=>n.id===page)?.label}</b></div><div className="top-actions">{logged&&<button className={`push-toggle ${pushEnabled?'enabled':''}`} onClick={()=>void activatePushNotifications()} disabled={pushBusy||pushEnabled} title={pushEnabled?'Notificações ativadas neste dispositivo':'Ativar notificações de novos pedidos'}><Bell size={17}/>{pushBusy?'Ativando...':pushEnabled?'Notificações ativadas':'Ativar notificações'}</button>}<div className="avatar" title={user.name}>{user.name.slice(0,1).toUpperCase()}</div></div></header>
     <section className="content">
       {page==='dashboard'&&<><div className="welcome"><div><span className="eyebrow">{new Date().toLocaleDateString('pt-BR',{weekday:'long'}).toLocaleUpperCase('pt-BR')} • DOCE CACAU</span><h1>Olá, {user.name.split(' ')[0]}! <span>☕</span></h1><p>Veja como está a sua chocolateria hoje.</p></div><button className="primary" onClick={()=>setPage('pos')}><Plus size={18}/> Nova venda</button></div><div className="stats-grid"><Stat icon={<Wallet/>} label="Vendas do mês" value={money(monthTotal)} hint={`${monthOrders.length} pedidos registrados`}/><Stat icon={<ClipboardList/>} label="Reservas pendentes" value={String(data.orders.filter(o=>o.deliveryStatus==='Reservado'&&!o.isCanceled).length)} hint="Aguardando retirada"/><Stat icon={<TrendingUp/>} label="A receber" value={money(unpaid)} hint="Saldo de pedidos em aberto"/><Stat icon={<Package/>} label="Produtos cadastrados" value={String(activeProducts.length)} hint={`${low.length} com estoque baixo`}/></div><div className="dashboard-grid"><div className="panel"><div className="panel-title"><div><h2>Movimentações recentes</h2><p>Últimas atividades registradas</p></div><button className="text-btn" onClick={()=>setPage('stock')}>Ver estoque</button></div>{data.movements.slice(0,6).length?data.movements.slice(0,6).map(m=><div className="activity" key={m.id}><span className="activity-icon"><Package size={17}/></span><div><b>{m.productName}</b><small>{m.detail} · {m.user}</small></div><strong className={m.type==='Entrada'?'positive':''}>{m.type==='Entrada'?'+':'−'}{m.quantity}</strong></div>):<Empty text="As movimentações aparecerão aqui quando você cadastrar produtos e registrar vendas."/>}</div><div className="panel"><div className="panel-title"><div><h2>Atenção ao estoque</h2><p>Produtos no limite mínimo</p></div><AlertTriangle size={19} className="warning-text"/></div>{low.length?low.slice(0,6).map(p=><div className="stock-alert" key={p.id}><div><b>{p.name}</b><small>Mínimo: {p.minStock} unidades</small></div><span className="badge danger">{p.stock} un.</span></div>):<Empty text="Nenhum produto com estoque baixo."/>}</div></div><div className="panel"><div className="panel-title"><div><h2>Reservas recentes</h2><p>Pedidos aguardando retirada</p></div><button className="text-btn" onClick={()=>setPage('orders')}>Ver todas</button></div><OrderTable orders={data.orders.filter(o=>o.deliveryStatus==='Reservado'&&!o.isCanceled).slice(0,5)} onChange={changeOrder} onPay={setPaymentOrder} onEdit={setOrderEditor} onCancel={setCancelTarget} onDetails={setOrderDetails}/></div></>}
       {page==='products'&&<><PageHeading title="Produtos" desc="Cadastre e organize os chocolates da sua loja." action={<div className="products-heading-actions"><button className="secondary" onClick={exportProductCatalogPdf}><FileText size={17}/> Catálogo</button><button className="primary" onClick={()=>openProduct()}><Plus size={18}/> Novo produto</button></div>}/><div className="toolbar"><div className="search"><Search/><input placeholder="Buscar por nome, categoria ou código..." value={search} onChange={e=>setSearch(e.target.value)}/></div><button className="secondary" onClick={()=>{setScanTarget('product');setScannerOpen(true)}}><ScanBarcode size={18}/> Ler código</button></div><div className="panel table-panel"><div className="table-wrap"><table><thead><tr><th>Produto</th><th>Código de barras</th><th>Categoria</th><th>Custo</th><th>Preço</th><th>Estoque</th><th></th></tr></thead><tbody>{filteredProducts.map(p=><tr key={p.id}><td><b>{p.name}</b><small>{p.brand} · {p.updatedByName||p.createdByName||'Responsável não identificado'}</small></td><td>{p.barcode||'—'}</td><td>{p.category}</td><td>{money(p.cost)}</td><td><b>{money(p.price)}</b></td><td><span className={`badge ${p.stock<=p.minStock?'danger':'success'}`}>{p.stock} un.</span></td><td><button className="icon-btn" onClick={()=>openProduct(p)}><Pencil size={16}/></button></td></tr>)}</tbody></table>{!filteredProducts.length&&<Empty text="Nenhum produto cadastrado. Comece adicionando seu primeiro chocolate."/>}</div></div>{archivedProducts.length>0&&<div className="panel table-panel"><div className="panel-title"><div><h2>Produtos arquivados</h2><p>{archivedProducts.length} produto(s) sem estoque há mais de 90 dias. Histórico preservado.</p></div></div><div className="table-wrap"><table><thead><tr><th>Produto</th><th>Arquivado em</th><th>Último estoque</th><th>Ação</th></tr></thead><tbody>{archivedProducts.map(p=><tr key={p.id}><td><b>{p.name}</b><small>{p.brand} · {p.category}</small></td><td>{(p as any).archivedAt?new Date((p as any).archivedAt).toLocaleDateString('pt-BR'):'—'}</td><td>{p.stock} un.</td><td><button className="secondary small" onClick={async()=>{try{if(db){await setDoc(doc(db,'stores','doce-cacau','products',p.id),{archived:false,archivedAt:null,archiveReason:null,outOfStockSince:p.stock>0?null:new Date().toISOString()},{merge:true})}else{await persist({...data,products:data.products.map(x=>x.id===p.id?({...x,archived:false,archivedAt:null,outOfStockSince:x.stock>0?undefined:new Date().toISOString()} as Product):x)})}notify('Produto reativado com sucesso.')}catch(e){notify('Não foi possível reativar: '+(e as Error).message)}}}>Reativar produto</button></td></tr>)}</tbody></table></div></div>}</>}
@@ -968,7 +1002,7 @@ export default function App() {
         </div>
       })()}
       {page==='loja'&&<LojaVirtual initialSettings={lojaSettings} onSave={saveLojaSettings}/> }
-      {page==='pedidos-loja'&&<PedidosLojaAdmin getToken={getAdminToken}/>}
+      {page==='pedidos-loja'&&<PedidosLojaAdmin getToken={getAdminToken} onPendingCountChange={setNewPublicOrders}/>}
       {page==='users'&&<><PageHeading title="Equipe" desc="Todos os integrantes têm perfil de administrador e acesso aos mesmos dados."/>
         <div className="panel" id="team-profile">
           <div className="panel-title"><div><h2>{selectedTeamUser?.uid===auth?.currentUser?.uid?'Meu perfil':selectedTeamUser?'Editar administrador':'Editar perfil'}</h2><p>{selectedTeamUser?'Altere o nome que aparece nos registros e na equipe.':'Selecione um usuário na lista abaixo para editar seu nome.'}</p></div></div>

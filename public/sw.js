@@ -1,4 +1,4 @@
-const CACHE_NAME = 'doce-cacau-shell-v1';
+const CACHE_NAME = 'doce-cacau-shell-v2';
 const APP_SHELL = ['/index.html', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -57,4 +57,36 @@ self.addEventListener('fetch', (event) => {
       })
     );
   }
+});
+
+
+// Push de novo pedido: o payload contém somente identificador/número do pedido,
+// nunca nome, telefone, endereço ou itens do cliente.
+self.addEventListener('push', (event) => {
+  let payload = {};
+  try { const raw = event.data ? event.data.json() : {}; payload = raw.data || raw; } catch { payload = { body: event.data?.text() || '' }; }
+  const title = payload.title || 'Novo pedido · Doce Cacau';
+  const options = {
+    body: payload.body || 'Um novo pedido está aguardando atendimento.',
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
+    tag: payload.tag || `doce-cacau-${payload.orderNumber || Date.now()}`, 
+    renotify: true,
+    data: { url: '/?page=pedidos-loja' }
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const target = new URL('/?page=pedidos-loja', self.location.origin).href;
+  event.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+    for (const client of clients) {
+      if (client.url.startsWith(self.location.origin) && 'focus' in client) {
+        client.navigate(target);
+        return client.focus();
+      }
+    }
+    return self.clients.openWindow(target);
+  }));
 });

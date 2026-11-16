@@ -13,6 +13,10 @@ service cloud.firestore {
     match /stores/doce-cacau/users/{userId} {
       allow read: if activeStoreMember() || (signedIn() && request.auth.uid == userId);
       allow create, update, delete: if activeStoreMember();
+      // Tokens push são privados e cada usuário só administra os próprios dispositivos.
+      match /push_tokens/{tokenId} {
+        allow read, write: if signedIn() && request.auth.uid == userId;
+      }
     }
     match /stores/doce-cacau/{collectionName}/{documentId} {
       allow read, write: if activeStoreMember()
