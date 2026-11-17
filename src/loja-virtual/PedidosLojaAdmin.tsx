@@ -61,7 +61,7 @@ export default function PedidosLojaAdmin({getToken,onPendingCountChange}:Props) 
 
     try{
       const token=await getToken()
-      const r=await fetch(`/api/loja/admin/pedidos/${encodeURIComponent(order.id)}`,{
+      const r=await fetch(`/api/loja/admin/pedidos?token=${encodeURIComponent(order.id)}`,{
         method:'PATCH',
         headers:{
           Authorization:`Bearer ${token}`,
@@ -87,7 +87,7 @@ export default function PedidosLojaAdmin({getToken,onPendingCountChange}:Props) 
   async function openProof(order:PublicOrder){
     if(!order.proofFileId)return
     const tab=window.open('about:blank','_blank')
-    try{const token=await getToken();const r=await fetch(`/api/loja/admin/comprovante/${encodeURIComponent(order.id)}`,{headers:{Authorization:`Bearer ${token}`}});if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||'Não foi possível abrir o comprovante.')}const blob=await r.blob();const url=URL.createObjectURL(blob);if(tab)tab.location.href=url;else{const link=document.createElement('a');link.href=url;link.target='_blank';link.rel='noopener';link.click()}window.setTimeout(()=>URL.revokeObjectURL(url),60000)}catch(e){if(tab)tab.close();setError(e instanceof Error?e.message:'Falha ao abrir comprovante.')}
+    try{const token=await getToken();const r=await fetch(`/api/loja/admin/pedidos?token=${encodeURIComponent(order.id)}&action=comprovante`,{headers:{Authorization:`Bearer ${token}`}});if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||'Não foi possível abrir o comprovante.')}const blob=await r.blob();const url=URL.createObjectURL(blob);if(tab)tab.location.href=url;else{const link=document.createElement('a');link.href=url;link.target='_blank';link.rel='noopener';link.click()}window.setTimeout(()=>URL.revokeObjectURL(url),60000)}catch(e){if(tab)tab.close();setError(e instanceof Error?e.message:'Falha ao abrir comprovante.')}
   }
   return <section className="pedidos-loja-page">
     <header className="pedidos-loja-heading"><div><span>DOCE CACAU · COMÉRCIO DIGITAL</span><h1><PackageCheck/> Pedidos da loja virtual</h1><p>Confira os pedidos enviados pelos clientes antes de reservar o estoque.</p></div><button className="pedidos-refresh" onClick={()=>void load()} disabled={loading}><RefreshCw size={16}/> Atualizar</button></header>
