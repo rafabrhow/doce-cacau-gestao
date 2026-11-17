@@ -59,7 +59,7 @@ export default function CheckoutLoja({items,resumeToken='',onBack,onFinished}:Pr
         if(!response.ok)throw new Error(data.error||'Não foi possível preparar o checkout.')
         if(alive){setConfig(data.settings);setProducts(data.products||[])}
         if(resumeToken){
-          const draftResponse=await fetch(`/api/loja/rascunhos/${encodeURIComponent(resumeToken)}`)
+          const draftResponse=await fetch(`/api/loja/rascunhos?token=${encodeURIComponent(resumeToken)}`)
           const draftData=await draftResponse.json()
           if(!draftResponse.ok)throw new Error(draftData.error||'Não foi possível recuperar o pedido salvo.')
           if(alive){setToken(resumeToken);setCustomer({...blank,...draftData.draft.customer});setOrderItems(draftData.draft.items||[]);setProofName(draftData.draft.proofFileName||'');if(draftData.draft.status==='finalizado'){setOrderNumber(draftData.draft.orderNumber||'');setStep('concluido')}else{setStep('pagamento')}}
@@ -93,7 +93,7 @@ export default function CheckoutLoja({items,resumeToken='',onBack,onFinished}:Pr
   }
   async function saveDraft(nextCustomer=customer,targetToken=token){
     if(!targetToken)return
-    const response=await fetch(`/api/loja/rascunhos/${encodeURIComponent(targetToken)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:orderItems,customer:nextCustomer})})
+    const response=await fetch(`/api/loja/rascunhos?token=${encodeURIComponent(targetToken)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:orderItems,customer:nextCustomer})})
     const data=await response.json().catch(()=>({}))
     if(!response.ok)throw new Error(data.error||'Não foi possível salvar o pedido.')
   }
@@ -116,7 +116,7 @@ export default function CheckoutLoja({items,resumeToken='',onBack,onFinished}:Pr
   async function uploadProof(){
     if(!proof||!token)return
     const form=new FormData();form.append('proof',proof)
-    const response=await fetch(`/api/loja/rascunhos/${encodeURIComponent(token)}/comprovante`,{method:'POST',body:form})
+    const response=await fetch(`/api/loja/rascunhos?token=${encodeURIComponent(token)}&action=comprovante`,{method:'POST',body:form})
     const data=await response.json()
     if(!response.ok)throw new Error(data.error||'Não foi possível anexar o comprovante.')
     setProofName(proof.name)
@@ -129,7 +129,7 @@ export default function CheckoutLoja({items,resumeToken='',onBack,onFinished}:Pr
         await uploadProof()
       }
       await saveDraft()
-      const response=await fetch(`/api/loja/rascunhos/${encodeURIComponent(token)}/finalizar`,{method:'POST'})
+      const response=await fetch(`/api/loja/rascunhos?token=${encodeURIComponent(token)}&action=finalizar`,{method:'POST'})
       const data=await response.json()
       if(!response.ok)throw new Error(data.error||'Não foi possível finalizar o pedido.')
       setOrderNumber(data.orderNumber)
