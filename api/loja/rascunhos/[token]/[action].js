@@ -1,7 +1,7 @@
 // Rotas explícitas da Vercel para ações de um rascunho:
 // POST /:token/comprovante e POST /:token/finalizar.
 // A lógica de negócio permanece centralizada no server.js.
-import app from '../../../../../server.js'
+import app from '../../../../server.js'
 
 export const config = { api: { bodyParser: false } }
 

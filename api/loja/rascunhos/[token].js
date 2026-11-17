@@ -1,6 +1,6 @@
 // Rota explícita da Vercel para consultar/atualizar um rascunho da Loja Virtual.
 // Reutiliza os handlers e validações já existentes no server.js.
-import app from '../../../../server.js'
+import app from '../../../server.js'
 
 export const config = { api: { bodyParser: false } }
 
