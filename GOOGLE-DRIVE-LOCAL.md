@@ -14,6 +14,6 @@
 A API local valida o usuário logado com Firebase Admin. Gere uma chave de conta de serviço no projeto Firebase correto (`doce-cacau-66cbe`) e coloque o JSON em `FIREBASE_SERVICE_ACCOUNT_JSON`. Não use a configuração pública do SDK Web como chave de serviço.
 
 ## Segurança e observações
-- `.env.local` e `.google-drive-token.json` são arquivos privados; não os publique nem os envie.
+- `.env.local` e `.google-drive-token-backup.json` são arquivos privados; não os publique nem os envie.
 - As imagens permanecem privadas no Google Drive. O Doce Cacau entrega as imagens somente pela API autenticada, após validar o usuário e confirmar que o arquivo pertence à pasta Doce Cacau/Produtos.
 - Esta primeira etapa é para desenvolvimento local. Esta implementação continua voltada ao desenvolvimento local. Antes de publicar, adapte a API para hospedagem com armazenamento seguro dos tokens (não use arquivo local efêmero), HTTPS, origens APP_ORIGINS explícitas e processo OAuth persistente/compartilhado entre instâncias.

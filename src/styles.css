@@ -681,3 +681,16 @@ td {
 .push-toggle:disabled { cursor: default; opacity: .75; }
 .push-toggle.enabled { color: #15803d; border-color: #86efac; }
 @media (max-width: 640px) { .push-toggle { padding: 9px; } .push-toggle:not(.enabled) { font-size: 0; gap: 0; } .push-toggle:not(.enabled) svg { width: 18px; height: 18px; } }
+
+/* Catálogo: alternativas de PDF e loja virtual */
+.catalog-options-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:18px}
+.catalog-option-card{display:flex;flex-direction:column;align-items:flex-start;min-height:245px}
+.catalog-option-icon{width:44px;height:44px;border-radius:12px;background:#f3e8e0;color:#845a45;display:grid;place-items:center;margin-bottom:12px}
+.catalog-option-card h2,.drive-integration-panel h2{font-size:15px;color:#503529;margin:0 0 8px}
+.catalog-option-card p,.drive-integration-panel p{font-size:11px;line-height:1.65;color:#927c70;margin:0 0 18px;max-width:560px}
+.catalog-option-card button{margin-top:auto}
+.drive-integration-panel{display:flex;align-items:center;justify-content:space-between;gap:18px}
+.drive-integration-panel p{margin-bottom:10px}
+.drive-integration-actions{display:flex;gap:8px;flex-wrap:wrap;flex-shrink:0}
+.drive-reconnect-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px}
+@media(max-width:760px){.catalog-options-grid{grid-template-columns:1fr}.catalog-option-card{min-height:unset}.drive-integration-panel{align-items:flex-start;flex-direction:column}.drive-integration-actions{width:100%}.drive-integration-actions button{flex:1}.drive-reconnect-row{align-items:flex-start;flex-direction:column}.drive-reconnect-row button{width:100%}}

@@ -66,9 +66,15 @@ async function readTokens() {
   }
   try { return fs.existsSync(TOKEN_PATH) ? JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8')) : null } catch { return null }
 }
-async function saveTokens(tokens) {
-  const current = await readTokens().catch(() => null) || {}
+async function saveTokens(tokens, { replace = false } = {}) {
+  // Na reconexão explícita, não reutilize um refresh_token antigo/revogado.
+  // Na renovação automática, preserve o refresh_token porque o Google normalmente
+  // não o envia novamente junto com cada novo access_token.
+  const current = replace ? {} : (await readTokens().catch(() => null) || {})
   const merged = { ...current, ...tokens }
+  if (replace && !tokens.refresh_token) {
+    throw new Error('O Google não retornou um novo token de atualização. Revogue o acesso antigo do Doce Cacau na sua Conta Google e tente conectar novamente.')
+  }
   if (isProduction) {
     if (!firebaseReady) throw new Error('Firebase Admin não está configurado na Vercel.')
     const encrypted = encryptTokens(merged)
@@ -184,8 +190,29 @@ async function assertProductImage(drive, fileId) {
 app.get('/api/drive/status', requireUser, async (_req, res) => {
   const configured = required.every(key => Boolean(process.env[key])) && (!isProduction || Boolean(process.env.GOOGLE_TOKEN_ENCRYPTION_KEY))
   let connected = false
-  try { connected = Boolean(await loadDriveAuth()) } catch (error) { console.error('Status Google Drive:', error.message) }
-  res.json({ configured, connected, folder: 'Doce Cacau/Produtos' })
+  let reauthorizationRequired = false
+  let message = ''
+  try {
+    const auth = await loadDriveAuth()
+    if (auth) {
+      // Apenas existir um objeto OAuth não significa que o refresh_token ainda é válido.
+      // Esta chamada força o Google a validar a autorização de verdade.
+      await google.drive({ version: 'v3', auth }).about.get({ fields: 'user' })
+      connected = true
+    } else {
+      message = 'Google Drive ainda não foi conectado.'
+    }
+  } catch (error) {
+    const googleCode = String(error?.response?.data?.error || error?.code || '')
+    const errorText = String(error?.message || '')
+    reauthorizationRequired = googleCode === 'invalid_grant' || errorText.includes('invalid_grant')
+    message = reauthorizationRequired
+      ? 'A autorização do Google Drive expirou ou foi revogada. Reconecte sua conta.'
+      : 'Não foi possível validar a conexão com o Google Drive.'
+    console.error('Status Google Drive:', { code: googleCode, message: errorText })
+  }
+  res.setHeader('Cache-Control', 'no-store')
+  res.json({ configured, connected, reauthorizationRequired, message, folder: 'Doce Cacau/Produtos' })
 })
 app.get('/api/drive/connect', requireUser, async (req, res) => {
   try {
@@ -204,11 +231,22 @@ app.get('/api/drive/oauth2callback', async (req, res) => {
     if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) return res.status(400).send('Autorização expirada ou inválida. Volte ao Doce Cacau e tente conectar novamente.')
     if (req.query.error) return res.status(400).send('A autorização do Google foi cancelada.')
     const { tokens } = await oauthClient().getToken(String(req.query.code || ''))
-    await saveTokens(tokens)
+    if (!tokens.refresh_token) {
+      throw new Error('O Google não retornou refresh_token. Revogue o acesso antigo do Doce Cacau na Conta Google e tente novamente.')
+    }
     const client = oauthClient(); client.setCredentials(tokens)
-    await getProductsFolder(google.drive({ version: 'v3', auth: client }))
-    res.send('<h2>Google Drive conectado!</h2><p>Você já pode voltar ao Doce Cacau.</p><script>setTimeout(()=>window.close(),1800)</script>')
-  } catch (error) { console.error('OAuth callback:', error); res.status(500).send('Falha ao conectar o Google Drive. Verifique as variáveis de ambiente do servidor.') }
+    const drive = google.drive({ version: 'v3', auth: client })
+    await drive.about.get({ fields: 'user' })
+    await getProductsFolder(drive)
+    // A troca é intencional: não manter o refresh_token antigo que gerou invalid_grant.
+    await saveTokens(tokens, { replace: true })
+    res.send('<!doctype html><html lang="pt-BR"><meta charset="utf-8"><title>Google Drive conectado</title><body style="font-family:Arial,sans-serif;padding:32px;color:#503529"><h2>Google Drive conectado!</h2><p>A autorização foi renovada. Você já pode voltar ao Doce Cacau.</p><script>if(window.opener){window.opener.postMessage({type:"DOCE_CACAU_DRIVE_CONNECTED"},window.location.origin)}setTimeout(()=>window.close(),1400)</script></body></html>')
+  } catch (error) {
+    console.error('OAuth callback:', error)
+    const message = String(error?.message || 'Falha ao conectar o Google Drive.')
+    const safeMessage = message.replace(/[<>]/g, '').slice(0, 500)
+    res.status(500).send(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><title>Falha na conexão</title><body style="font-family:Arial,sans-serif;padding:32px;color:#503529"><h2>Não foi possível conectar o Google Drive</h2><p>${safeMessage}</p><p>Volte ao Doce Cacau e tente novamente.</p></body></html>`)
+  }
 })
 app.post('/api/drive/upload', requireUser, upload.single('image'), async (req, res) => {
   try {
@@ -229,16 +267,37 @@ app.post('/api/drive/upload', requireUser, upload.single('image'), async (req, r
 })
 app.get('/api/drive/image/:id', requireUser, async (req, res) => {
   try {
+    const fileId = String(req.params.id || '').trim()
+    if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) return res.status(400).json({ error: 'Identificador de imagem inválido.' })
+    const products = admin.firestore().collection('stores/doce-cacau/products')
+    const [primary, secondary] = await Promise.all([
+      products.where('driveFileId', '==', fileId).limit(1).get(),
+      products.where('driveFileId2', '==', fileId).limit(1).get()
+    ])
+    const product = primary.docs[0]?.data() || secondary.docs[0]?.data()
+    if (!product || product.archived === true || product.isCanceled === true) {
+      return res.status(404).json({ error: 'A imagem não está vinculada a um produto ativo.' })
+    }
     const auth = await loadDriveAuth()
-    if (!auth) return res.status(409).json({ error: 'Google Drive desconectado.' })
+    if (!auth) return res.status(409).json({ error: 'Google Drive desconectado. Reconecte sua conta.' })
     const drive = google.drive({ version: 'v3', auth })
-    const metadata = await assertProductImage(drive, String(req.params.id || ''))
-    const result = await drive.files.get({ fileId: req.params.id, alt: 'media' }, { responseType: 'stream' })
-    res.setHeader('Content-Type', metadata.mimeType)
+    const metadata = await drive.files.get({ fileId, fields: 'id,mimeType,trashed' })
+    if (metadata.data.trashed || !String(metadata.data.mimeType || '').startsWith('image/')) {
+      return res.status(404).json({ error: 'O arquivo vinculado não é uma imagem disponível.' })
+    }
+    const result = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' })
+    res.setHeader('Content-Type', metadata.data.mimeType)
     res.setHeader('Cache-Control', 'private, max-age=300')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
     result.data.on('error', error => { console.error('Erro ao transmitir imagem:', error); if (!res.headersSent) res.status(502).end() })
     result.data.pipe(res)
-  } catch (error) { console.error('Imagem Drive:', error.message); res.status(error.status || 404).json({ error: error.status ? error.message : 'Não foi possível carregar a imagem do Drive.' }) }
+  } catch (error) {
+    const code = String(error?.response?.data?.error || error?.code || '')
+    console.error('Imagem Drive:', error.message)
+    res.status(code === 'invalid_grant' ? 409 : (error.status || 500)).json({
+      error: code === 'invalid_grant' ? 'A autorização do Google Drive expirou. Reconecte sua conta.' : (error.status ? error.message : 'Não foi possível carregar a imagem do Drive.')
+    })
+  }
 })
 app.delete('/api/drive/file/:id', requireUser, async (req, res) => {
   try {
@@ -256,27 +315,49 @@ app.delete('/api/drive/file/:id', requireUser, async (req, res) => {
 // Catálogo público da Loja Virtual: entrega somente campos comerciais autorizados.
 app.get('/api/loja/catalogo', async (_req, res) => {
   try {
-    if (!firebaseReady) return res.status(503).json({ error: 'Catálogo temporariamente indisponível.' })
-    const storeRef = admin.firestore().doc('stores/doce-cacau/settings/loja-virtual')
+    if (!firebaseReady) {
+      return res.status(503).json({ error: 'Catálogo temporariamente indisponível: Firebase Admin não configurado.' })
+    }
+
+    const db = admin.firestore()
+    const storeRef = db.doc('stores/doce-cacau/settings/loja-virtual')
     const settingsSnap = await storeRef.get()
     const settings = settingsSnap.exists ? settingsSnap.data() : {}
-    if (settings.enabled !== true) return res.status(404).json({ error: 'A loja virtual está temporariamente fechada.' })
-    const productsSnap = await admin.firestore().collection('stores/doce-cacau/products').get()
-    const products = productsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
-      .filter(p => p.archived !== true && Number(p.stock) > 0 && p.isCanceled !== true)
-      .map(p => ({
-        id: p.id,
-        name: String(p.name || ''),
-        category: String(p.category || ''),
-        brand: String(p.brand || ''),
-        price: Number(p.price) || 0,
-        imageUrl: p.driveFileId ? `/api/loja/imagem/${encodeURIComponent(String(p.driveFileId))}` : (String(p.image || '').startsWith('https://') ? p.image : ''),
-        imageUrls: [
-          p.driveFileId ? `/api/loja/imagem/${encodeURIComponent(String(p.driveFileId))}` : (String(p.image || '').startsWith('https://') ? p.image : ''),
-          p.driveFileId2 ? `/api/loja/imagem/${encodeURIComponent(String(p.driveFileId2))}` : ''
+
+    if (settings.enabled !== true) {
+      return res.status(404).json({ error: 'A loja virtual está temporariamente fechada.' })
+    }
+
+    const productsSnap = await db.collection('stores/doce-cacau/products').get()
+    const products = productsSnap.docs
+      .map(doc => ({ id: doc.id, ...doc.data() }))
+      .filter(product =>
+        product.archived !== true &&
+        product.isCanceled !== true &&
+        Number(product.stock) > 0 &&
+        Number(product.price) > 0 &&
+        String(product.name || '').trim()
+      )
+      .map(product => {
+        const primaryId = String(product.driveFileId || '').trim()
+        const secondaryId = String(product.driveFileId2 || '').trim()
+        const legacyImage = String(product.image || '').startsWith('https://') ? product.image : ''
+        const imageUrls = [
+          primaryId ? `/api/loja/imagem/${encodeURIComponent(primaryId)}` : legacyImage,
+          secondaryId ? `/api/loja/imagem/${encodeURIComponent(secondaryId)}` : ''
         ].filter(Boolean)
-      }))
-      .filter(p => p.name && p.price > 0)
+
+        return {
+          id: product.id,
+          name: String(product.name).trim(),
+          category: String(product.category || ''),
+          brand: String(product.brand || ''),
+          price: Number(product.price),
+          imageUrl: imageUrls[0] || '',
+          imageUrls
+        }
+      })
+
     res.setHeader('Cache-Control', 'no-store')
     res.json({ storeName: 'Doce Cacau', products })
   } catch (error) {
@@ -285,30 +366,68 @@ app.get('/api/loja/catalogo', async (_req, res) => {
   }
 })
 
-// Imagens públicas somente quando o arquivo pertence a um produto atualmente disponível.
+// Imagens públicas: o vínculo do ID ao produto ativo no Firestore é a autorização.
+// Não exigimos que o arquivo esteja na pasta "Produtos", pois essa validação por
+// pasta pode rejeitar imagens antigas válidas caso a pasta tenha sido recriada.
 app.get('/api/loja/imagem/:id', async (req, res) => {
   try {
-    if (!firebaseReady) return res.status(503).end()
-    const fileId = String(req.params.id || '')
+    if (!firebaseReady) {
+      return res.status(503).json({ error: 'Serviço de imagens temporariamente indisponível.' })
+    }
+
+    const fileId = String(req.params.id || '').trim()
+    if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
+      return res.status(400).json({ error: 'Identificador de imagem inválido.' })
+    }
+
     const productsRef = admin.firestore().collection('stores/doce-cacau/products')
-    const [primarySnap,secondarySnap] = await Promise.all([
+    const [primarySnap, secondarySnap] = await Promise.all([
       productsRef.where('driveFileId', '==', fileId).limit(1).get(),
       productsRef.where('driveFileId2', '==', fileId).limit(1).get()
     ])
+
     const product = primarySnap.docs[0]?.data() || secondarySnap.docs[0]?.data()
-    if (!product || product.archived === true || Number(product.stock) <= 0) return res.status(404).end()
+    if (!product || product.archived === true || product.isCanceled === true || Number(product.stock) <= 0) {
+      return res.status(404).json({ error: 'Imagem não vinculada a um produto disponível.' })
+    }
+
     const auth = await loadDriveAuth()
-    if (!auth) return res.status(503).end()
+    if (!auth) {
+      return res.status(503).json({ error: 'Google Drive não está conectado.' })
+    }
+
     const drive = google.drive({ version: 'v3', auth })
-    const metadata = await assertProductImage(drive, fileId)
+    const metadata = await drive.files.get({
+      fileId,
+      fields: 'id,mimeType,trashed'
+    })
+
+    if (metadata.data.trashed || !String(metadata.data.mimeType || '').startsWith('image/')) {
+      return res.status(404).json({ error: 'O arquivo vinculado não é uma imagem disponível.' })
+    }
+
     const result = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' })
-    res.setHeader('Content-Type', metadata.mimeType)
-    res.setHeader('Cache-Control', 'public, max-age=300')
-    result.data.on('error', error => { console.error('Imagem pública Drive:', error); if (!res.headersSent) res.status(502).end() })
+    res.setHeader('Content-Type', metadata.data.mimeType)
+    res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    result.data.on('error', error => {
+      console.error('Transmissão da imagem do catálogo:', error)
+      if (!res.headersSent) res.status(502).end()
+      else res.destroy(error)
+    })
     result.data.pipe(res)
   } catch (error) {
-    console.error('Imagem do catálogo:', error.message)
-    if (!res.headersSent) res.status(error.status || 404).end()
+    const status = Number(error.status) || Number(error.code) || 500
+    console.error('Imagem do catálogo:', {
+      message: error.message,
+      code: error.code,
+      status: error.status,
+      fileId: req.params.id
+    })
+    if (!res.headersSent) {
+      res.status(status >= 400 && status <= 599 ? status : 500)
+        .json({ error: 'Não foi possível carregar a imagem do catálogo.' })
+    }
   }
 })
 
