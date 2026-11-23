@@ -4,7 +4,7 @@ import App from './App'
 import CatalogoPublico from './loja-virtual/CatalogoPublico'
 import './styles.css'
 
-const isPublicCatalog = window.location.pathname.replace(/\/+$/, '') === '/loja'
+const isPublicCatalog = window.location.hostname === 'loja-docecacau.rddl.com.br' || window.location.pathname.replace(/\/+$/, '') === '/loja'
 
 function configureAdminInstall() {
   const manifest = document.createElement('link')
