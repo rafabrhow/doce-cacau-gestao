@@ -408,7 +408,7 @@ app.get('/api/loja/imagem/:id', async (req, res) => {
 
     const result = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' })
     res.setHeader('Content-Type', metadata.data.mimeType)
-    res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400')
+    res.setHeader('Cache-Control', 'public, max-age=2592000, stale-while-revalidate=604800')
     res.setHeader('X-Content-Type-Options', 'nosniff')
     result.data.on('error', error => {
       console.error('Transmissão da imagem do catálogo:', error)

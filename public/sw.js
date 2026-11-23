@@ -1,4 +1,5 @@
-const CACHE_NAME = 'doce-cacau-shell-v3';
+const CACHE_NAME = 'doce-cacau-shell-v4';
+const IMAGE_CACHE_NAME = 'doce-cacau-product-images-v1';
 const APP_SHELL = ['/index.html', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -12,7 +13,7 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))
+      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME && key !== IMAGE_CACHE_NAME).map((key) => caches.delete(key))))
       .then(() => self.clients.claim())
   );
 });
@@ -23,7 +24,24 @@ self.addEventListener('fetch', (event) => {
 
   if (request.method !== 'GET' || url.origin !== self.location.origin) return;
 
-  // A loja pública e as APIs permanecem fora do modo offline/PWA.
+  // Imagens públicas de produtos: cache persistente entre visitas.
+  // O ID do arquivo muda quando uma nova foto é enviada, evitando servir foto antiga.
+  if (url.pathname.startsWith('/api/loja/imagem/')) {
+    event.respondWith((async () => {
+      const cache = await caches.open(IMAGE_CACHE_NAME);
+      const cached = await cache.match(request);
+      if (cached) return cached;
+
+      const response = await fetch(request);
+      if (response.ok && response.type !== 'opaque') {
+        await cache.put(request, response.clone());
+      }
+      return response;
+    })());
+    return;
+  }
+
+  // Catálogo e demais APIs continuam consultando o servidor para manter dados atualizados.
   if (url.pathname === '/loja' || url.pathname.startsWith('/loja/') || url.pathname.startsWith('/api/')) return;
 
   if (request.mode === 'navigate') {
